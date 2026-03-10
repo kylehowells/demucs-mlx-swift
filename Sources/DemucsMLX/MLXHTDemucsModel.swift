@@ -43,9 +43,8 @@ struct HTDemucsRuntimeConfig {
     let useTrainSegment: Bool
 
     static func fromJSON(_ json: [String: Any]) throws -> HTDemucsRuntimeConfig {
-        guard let kwargs = json["kwargs"] as? [String: Any] else {
-            throw DemucsError.unsupportedModelBackend("Missing kwargs in exported config")
-        }
+        // Accept either { "kwargs": {...} } or direct kwargs dict
+        let kwargs = json["kwargs"] as? [String: Any] ?? json
 
         func int(_ key: String, _ fallback: Int) -> Int {
             if let v = kwargs[key] as? Int { return v }
@@ -155,10 +154,10 @@ final class HTDemucsGraph: Module {
 
     @ModuleInfo(key: "freq_emb") var freqEmb: ScaledEmbedding
 
-    @ModuleInfo(key: "channel_upsampler") var channelUpsampler: Conv1dNCL
-    @ModuleInfo(key: "channel_downsampler") var channelDownsampler: Conv1dNCL
-    @ModuleInfo(key: "channel_upsampler_t") var channelUpsamplerT: Conv1dNCL
-    @ModuleInfo(key: "channel_downsampler_t") var channelDownsamplerT: Conv1dNCL
+    @ModuleInfo(key: "channel_upsampler") var channelUpsampler: Conv1dNCL?
+    @ModuleInfo(key: "channel_downsampler") var channelDownsampler: Conv1dNCL?
+    @ModuleInfo(key: "channel_upsampler_t") var channelUpsamplerT: Conv1dNCL?
+    @ModuleInfo(key: "channel_downsampler_t") var channelDownsamplerT: Conv1dNCL?
 
     @ModuleInfo(key: "crosstransformer") var crosstransformer: CrossTransformerEncoder
 
@@ -191,13 +190,22 @@ final class HTDemucsGraph: Module {
             scale: config.embScale
         )
 
-        self._channelUpsampler.wrappedValue = Conv1dNCL(max(1, transformerChannels), max(1, config.bottomChannels), kernelSize: 1)
-        self._channelDownsampler.wrappedValue = Conv1dNCL(max(1, config.bottomChannels), max(1, transformerChannels), kernelSize: 1)
-        self._channelUpsamplerT.wrappedValue = Conv1dNCL(max(1, transformerChannels), max(1, config.bottomChannels), kernelSize: 1)
-        self._channelDownsamplerT.wrappedValue = Conv1dNCL(max(1, config.bottomChannels), max(1, transformerChannels), kernelSize: 1)
+        var crossDim = transformerChannels
+        if config.bottomChannels > 0 {
+            self._channelUpsampler.wrappedValue = Conv1dNCL(transformerChannels, config.bottomChannels, kernelSize: 1)
+            self._channelDownsampler.wrappedValue = Conv1dNCL(config.bottomChannels, transformerChannels, kernelSize: 1)
+            self._channelUpsamplerT.wrappedValue = Conv1dNCL(transformerChannels, config.bottomChannels, kernelSize: 1)
+            self._channelDownsamplerT.wrappedValue = Conv1dNCL(config.bottomChannels, transformerChannels, kernelSize: 1)
+            crossDim = config.bottomChannels
+        } else {
+            self._channelUpsampler.wrappedValue = nil
+            self._channelDownsampler.wrappedValue = nil
+            self._channelUpsamplerT.wrappedValue = nil
+            self._channelDownsamplerT.wrappedValue = nil
+        }
 
         self._crosstransformer.wrappedValue = CrossTransformerEncoder(
-            dim: max(1, config.bottomChannels),
+            dim: crossDim,
             hiddenScale: config.tHiddenScale,
             numHeads: config.tHeads,
             numLayers: config.tLayers,
@@ -510,18 +518,18 @@ final class HTDemucsGraph: Module {
                 let t = x.dim(3)
 
                 x = x.reshaped([b, c, f * t])
-                x = channelUpsampler(x)
+                x = channelUpsampler!(x)
                 x = x.reshaped([b, config.bottomChannels, f, t])
-                xt = channelUpsamplerT(xt)
+                xt = channelUpsamplerT!(xt)
 
                 let out = crosstransformer(x, xt)
                 x = out.0
                 xt = out.1
 
                 x = x.reshaped([b, config.bottomChannels, f * t])
-                x = channelDownsampler(x)
+                x = channelDownsampler!(x)
                 x = x.reshaped([b, c, f, t])
-                xt = channelDownsamplerT(xt)
+                xt = channelDownsamplerT!(xt)
             } else {
                 let out = crosstransformer(x, xt)
                 x = out.0

@@ -80,7 +80,9 @@ final class DemucsEncoderBlock: Module {
         dconvComp: Float,
         dconvInit: Float,
         rewrite: Bool,
-        context: Int
+        context: Int,
+        dconvLstm: Bool = false,
+        dconvAttn: Bool = false
     ) {
         var mods: [Module] = []
 
@@ -103,7 +105,9 @@ final class DemucsEncoderBlock: Module {
                 channels: outputChannels,
                 compress: dconvComp,
                 depth: dconvDepth,
-                initialScale: dconvInit
+                initialScale: dconvInit,
+                lstm: dconvLstm,
+                attn: dconvAttn
             ))
         }
 
@@ -189,7 +193,9 @@ final class DemucsDecoderBlock: Module {
         dconvComp: Float,
         dconvInit: Float,
         rewrite: Bool,
-        context: Int
+        context: Int,
+        dconvLstm: Bool = false,
+        dconvAttn: Bool = false
     ) {
         self.isLast = isLast
         var mods: [Module] = []
@@ -212,7 +218,9 @@ final class DemucsDecoderBlock: Module {
                 channels: inputChannels,
                 compress: dconvComp,
                 depth: dconvDepth,
-                initialScale: dconvInit
+                initialScale: dconvInit,
+                lstm: dconvLstm,
+                attn: dconvAttn
             ))
         }
 
@@ -299,6 +307,8 @@ final class DemucsGraph: Module {
         for index in 0..<config.depth {
             let norm = index >= config.normStarts
             let dconvEnabled = (config.dconvMode & 1) != 0
+            let lstm = index >= config.dconvLstm
+            let attn = index >= config.dconvAttn
 
             let enc = DemucsEncoderBlock(
                 inputChannels: inChannels,
@@ -312,7 +322,9 @@ final class DemucsGraph: Module {
                 dconvComp: config.dconvComp,
                 dconvInit: config.dconvInit,
                 rewrite: config.rewrite,
-                context: config.context
+                context: config.context,
+                dconvLstm: lstm,
+                dconvAttn: attn
             )
             encoders.append(enc)
 
@@ -336,7 +348,9 @@ final class DemucsGraph: Module {
                 dconvComp: config.dconvComp,
                 dconvInit: config.dconvInit,
                 rewrite: config.rewrite,
-                context: config.context
+                context: config.context,
+                dconvLstm: lstm,
+                dconvAttn: attn
             )
             decoders.insert(dec, at: 0)
 

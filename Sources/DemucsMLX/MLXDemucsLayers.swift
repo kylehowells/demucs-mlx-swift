@@ -6,6 +6,18 @@ protocol DemucsUnaryLayer {
     func callAsFunction(_ x: MLXArray) -> MLXArray
 }
 
+/// Protocol for HDemucs encoder layers (both HEncLayer and MultiWrapEnc).
+protocol HEncoderLayer {
+    var empty: Bool { get }
+    func callAsFunction(_ x: MLXArray, inject: MLXArray?) -> MLXArray
+}
+
+/// Protocol for HDemucs decoder layers (both HDecLayer and MultiWrapDec).
+protocol HDecoderLayer {
+    var empty: Bool { get }
+    func callAsFunction(_ x: MLXArray, skip: MLXArray, length: Int) -> (MLXArray, MLXArray)
+}
+
 final class DemucsIdentity: Module, DemucsUnaryLayer {
     func callAsFunction(_ x: MLXArray) -> MLXArray { x }
 }
@@ -204,7 +216,16 @@ final class ConvTranspose2dNCHW: Module, DemucsUnaryLayer {
     }
 }
 
-final class GroupNormNCL: Module, DemucsUnaryLayer {
+/// Protocol for GroupNorm layers that expose their parameters for fused kernel use.
+protocol GroupNormParameters: AnyObject {
+    var groupCount: Int { get }
+    var channels: Int { get }
+    var eps: Float { get }
+    var weight: MLXArray { get }
+    var bias: MLXArray { get }
+}
+
+final class GroupNormNCL: Module, DemucsUnaryLayer, GroupNormParameters {
     let groupCount: Int
     let channels: Int
     let eps: Float
@@ -239,7 +260,7 @@ final class GroupNormNCL: Module, DemucsUnaryLayer {
     }
 }
 
-final class GroupNormNCHW: Module, DemucsUnaryLayer {
+final class GroupNormNCHW: Module, DemucsUnaryLayer, GroupNormParameters {
     let groupCount: Int
     let channels: Int
     let eps: Float
@@ -360,9 +381,11 @@ final class DConvSlot: Module, DemucsUnaryLayer {
         case .norm:
             return applyNorm(x)
         case .normGELU:
-            return demucsGELU(applyNorm(x))
+            guard let weight, let bias else { fatalError("Missing norm parameters in DConvSlot") }
+            return fusedGroupNormGELU(x, weight: weight, bias: bias, numGroups: 1, eps: eps)
         case .normGLU:
-            return demucsGLU(applyNorm(x), axis: 1)
+            guard let weight, let bias else { fatalError("Missing norm parameters in DConvSlot") }
+            return fusedGroupNormGLU(x, weight: weight, bias: bias, numGroups: 1, eps: eps)
         case .scale:
             guard let scale else { fatalError("Missing scale in DConvSlot.scale mode") }
             return x * scale.reshaped([scale.dim(0), 1])
@@ -406,7 +429,7 @@ final class DConvBlock: Module {
             mods.insert(DemucsLocalState(channels: hidden), at: 3)
         }
         if lstm {
-            mods.insert(DemucsBLSTM(dim: hidden), at: 3)
+            mods.insert(DemucsBLSTM(dim: hidden, layers: 2, maxSteps: 200, skip: true), at: 3)
         }
 
         mods.append(contentsOf: [
@@ -471,8 +494,9 @@ final class DConv: Module, DemucsUnaryLayer {
     }
 }
 
-final class HEncLayer: Module {
+final class HEncLayer: Module, HEncoderLayer {
     let freq: Bool
+    let kernelSizeValue: Int
     let strideValue: Int
     let empty: Bool
     let padValue: Int
@@ -506,6 +530,7 @@ final class HEncLayer: Module {
         dconvAttn: Bool = false
     ) {
         self.freq = freq
+        self.kernelSizeValue = kernelSize
         self.strideValue = stride
         self.empty = empty
         self.padValue = pad ? (kernelSize / 4) : 0
@@ -649,17 +674,14 @@ final class HEncLayer: Module {
             }
         }
 
-        // Apply norm1 (with fused GELU if norm enabled, else separate GELU)
-        if let n1 = norm1 {
-            if fusedNorm1 {
-                y = demucsGELU(applyDemucsUnary(n1, y))
-            } else {
-                y = demucsGELU(applyDemucsUnary(n1, y))
-            }
+        // Apply norm1 + GELU (fused when norm is a GroupNorm)
+        if let n1 = norm1, let gn = n1 as? GroupNormParameters {
+            y = fusedGroupNormGELU(y, weight: gn.weight, bias: gn.bias, numGroups: gn.groupCount, eps: gn.eps)
+        } else if let n1 = norm1 {
+            y = demucsGELU(applyDemucsUnary(n1, y))
         } else {
             y = demucsGELU(y)
         }
-
         if let dconvMod = dconv, dconvMod.layers.count > 0 {
             if freq {
                 let b = y.dim(0)
@@ -676,12 +698,10 @@ final class HEncLayer: Module {
 
         if let rw = rewrite {
             let rewritten = applyDemucsUnary(rw, y)
-            if let n2 = norm2 {
-                if fusedNorm2 {
-                    y = demucsGLU(applyDemucsUnary(n2, rewritten), axis: 1)
-                } else {
-                    y = demucsGLU(applyDemucsUnary(n2, rewritten), axis: 1)
-                }
+            if let n2 = norm2, let gn = n2 as? GroupNormParameters {
+                y = fusedGroupNormGLU(rewritten, weight: gn.weight, bias: gn.bias, numGroups: gn.groupCount, eps: gn.eps)
+            } else if let n2 = norm2 {
+                y = demucsGLU(applyDemucsUnary(n2, rewritten), axis: 1)
             } else {
                 y = demucsGLU(rewritten, axis: 1)
             }
@@ -691,12 +711,13 @@ final class HEncLayer: Module {
     }
 }
 
-final class HDecLayer: Module {
-    let last: Bool
+final class HDecLayer: Module, HDecoderLayer {
+    var last: Bool
     let freq: Bool
     let empty: Bool
     let padValue: Int
     let channelsIn: Int
+    let strideValue: Int
 
     @ModuleInfo(key: "conv_tr") var convTr: Module
     @ModuleInfo(key: "norm2") var norm2: Module
@@ -731,6 +752,7 @@ final class HDecLayer: Module {
         self.empty = empty
         self.padValue = pad ? (kernelSize / 4) : 0
         self.channelsIn = inputChannels
+        self.strideValue = stride
 
         if freq {
             self._convTr.wrappedValue = ConvTranspose2dNCHW(
@@ -850,7 +872,11 @@ final class HDecLayer: Module {
             pre = y + skip
             if let rewriteMod = rewrite, let norm1Mod = norm1 {
                 let rewritten = applyDemucsUnary(rewriteMod, pre)
-                pre = demucsGLU(applyDemucsUnary(norm1Mod, rewritten), axis: 1)
+                if let gn = norm1Mod as? GroupNormParameters {
+                    pre = fusedGroupNormGLU(rewritten, weight: gn.weight, bias: gn.bias, numGroups: gn.groupCount, eps: gn.eps)
+                } else {
+                    pre = demucsGLU(applyDemucsUnary(norm1Mod, rewritten), axis: 1)
+                }
             }
 
             if let dconvMod = dconv, dconvMod.layers.count > 0 {
@@ -887,5 +913,248 @@ final class HDecLayer: Module {
         }
 
         return (z, pre)
+    }
+}
+
+// MARK: - MultiWrap (multi-frequency band processing for HDemucs)
+
+/// Parameters needed to construct an HEncLayer for MultiWrap.
+struct HEncLayerParams {
+    let inputChannels: Int
+    let outputChannels: Int
+    let kernelSize: Int
+    let stride: Int
+    let normGroups: Int
+    let empty: Bool
+    let freq: Bool
+    let dconvEnabled: Bool
+    let normEnabled: Bool
+    let context: Int
+    let dconvDepth: Int
+    let dconvComp: Float
+    let dconvInit: Float
+    let pad: Bool
+    let rewrite: Bool
+    let dconvLstm: Bool
+    let dconvAttn: Bool
+}
+
+/// Parameters needed to construct an HDecLayer for MultiWrap.
+struct HDecLayerParams {
+    let inputChannels: Int
+    let outputChannels: Int
+    let last: Bool
+    let kernelSize: Int
+    let stride: Int
+    let normGroups: Int
+    let empty: Bool
+    let freq: Bool
+    let dconvEnabled: Bool
+    let normEnabled: Bool
+    let context: Int
+    let dconvDepth: Int
+    let dconvComp: Float
+    let dconvInit: Float
+    let pad: Bool
+    let contextFreq: Bool
+    let rewrite: Bool
+    let dconvLstm: Bool
+    let dconvAttn: Bool
+}
+
+/// Wraps multiple HEncLayer copies that each process a different frequency band.
+/// Used in HDemucs models with `multi_freqs` (e.g., mdx model 3).
+final class MultiWrapEnc: Module, HEncoderLayer {
+    let empty: Bool = false
+    let splitRatios: [Float]
+
+    @ModuleInfo(key: "layers") var layers: [HEncLayer]
+
+    init(params: HEncLayerParams, splitRatios: [Float]) {
+        self.splitRatios = splitRatios
+        let count = splitRatios.count + 1
+        var copies: [HEncLayer] = []
+        for _ in 0..<count {
+            // Python MultiWrap zeros the conv's internal padding (lay.conv.padding = (0, 0))
+            // after creating the layer, since MultiWrap handles padding manually.
+            // We achieve the same by passing pad: false.
+            copies.append(HEncLayer(
+                inputChannels: params.inputChannels,
+                outputChannels: params.outputChannels,
+                kernelSize: params.kernelSize,
+                stride: params.stride,
+                normGroups: params.normGroups,
+                empty: params.empty,
+                freq: params.freq,
+                dconvEnabled: params.dconvEnabled,
+                normEnabled: params.normEnabled,
+                context: params.context,
+                dconvDepth: params.dconvDepth,
+                dconvComp: params.dconvComp,
+                dconvInit: params.dconvInit,
+                pad: false,
+                rewrite: params.rewrite,
+                dconvLstm: params.dconvLstm,
+                dconvAttn: params.dconvAttn
+            ))
+        }
+        self._layers.wrappedValue = copies
+        super.init()
+    }
+
+    func callAsFunction(_ x: MLXArray, inject: MLXArray? = nil) -> MLXArray {
+        let fr = x.dim(2)
+        let ratios = splitRatios + [1.0]
+        var start = 0
+        var outs: [MLXArray] = []
+
+        for (ratioIdx, layer) in layers.enumerated() {
+            let ratio = ratios[ratioIdx]
+            let pad = layer.kernelSizeValue / 4
+
+            let limit: Int
+            if ratio >= 1.0 {
+                limit = fr
+            } else {
+                let rawLimit = Int((Float(fr) * ratio).rounded())
+                var le = rawLimit - start
+                if start == 0 { le += pad }
+                let frames = Int((Float(le - layer.kernelSizeValue) / Float(layer.strideValue) + 1).rounded())
+                var computedLimit = start + (frames - 1) * layer.strideValue + layer.kernelSizeValue
+                if start == 0 { computedLimit -= pad }
+                limit = computedLimit
+            }
+
+            var y = x[0..., 0..., start..<limit, 0...]
+
+            // Pad frequency dimension (using pad on last-1 dim for 4D)
+            if start == 0 {
+                var widths = [IntOrPair](repeating: 0, count: y.ndim)
+                widths[y.ndim - 2] = IntOrPair((pad, 0))
+                y = padded(y, widths: widths, mode: .constant)
+            }
+            if ratio >= 1.0 {
+                var widths = [IntOrPair](repeating: 0, count: y.ndim)
+                widths[y.ndim - 2] = IntOrPair((0, pad))
+                y = padded(y, widths: widths, mode: .constant)
+            }
+
+            outs.append(layer(y, inject: nil))
+            start = limit - layer.kernelSizeValue + layer.strideValue
+        }
+
+        return concatenated(outs, axis: 2)
+    }
+}
+
+/// Wraps multiple HDecLayer copies that each process a different frequency band.
+final class MultiWrapDec: Module, HDecoderLayer {
+    let empty: Bool = false
+    let splitRatios: [Float]
+
+    @ModuleInfo(key: "layers") var layers: [HDecLayer]
+
+    init(params: HDecLayerParams, splitRatios: [Float]) {
+        self.splitRatios = splitRatios
+        let count = splitRatios.count + 1
+        var copies: [HDecLayer] = []
+        for _ in 0..<count {
+            // Python MultiWrap sets lay.pad = False on decoder copies,
+            // since MultiWrap handles output trimming manually.
+            copies.append(HDecLayer(
+                inputChannels: params.inputChannels,
+                outputChannels: params.outputChannels,
+                last: params.last,
+                kernelSize: params.kernelSize,
+                stride: params.stride,
+                normGroups: params.normGroups,
+                empty: params.empty,
+                freq: params.freq,
+                dconvEnabled: params.dconvEnabled,
+                normEnabled: params.normEnabled,
+                context: params.context,
+                dconvDepth: params.dconvDepth,
+                dconvComp: params.dconvComp,
+                dconvInit: params.dconvInit,
+                pad: false,
+                contextFreq: params.contextFreq,
+                rewrite: params.rewrite,
+                dconvLstm: params.dconvLstm,
+                dconvAttn: params.dconvAttn
+            ))
+        }
+        self._layers.wrappedValue = copies
+        super.init()
+    }
+
+    /// Get the conv_tr bias from an HDecLayer (needed for overlap-add bias correction).
+    private func getConvTrBias(_ layer: HDecLayer) -> MLXArray? {
+        guard let ct = layer.convTr as? ConvTranspose2dNCHW else { return nil }
+        return ct.conv.bias
+    }
+
+    func callAsFunction(_ x: MLXArray, skip: MLXArray, length: Int) -> (MLXArray, MLXArray) {
+        let fr = x.dim(2)
+        let ratios = splitRatios + [1.0]
+        var start = 0
+        var outs: [MLXArray] = []
+
+        for (ratioIdx, layer) in layers.enumerated() {
+            let ratio = ratios[ratioIdx]
+            let limit: Int
+            if ratio >= 1.0 {
+                limit = fr
+            } else {
+                limit = Int((Float(fr) * ratio).rounded())
+            }
+
+            let savedLast = layer.last
+            layer.last = true
+
+            let y = x[0..., 0..., start..<limit]
+            let s = skip[0..., 0..., start..<limit]
+            var (out, _) = layer(y, skip: s, length: 0)
+
+            if !outs.isEmpty {
+                // Overlap-add with previous band, subtracting conv_tr bias to avoid
+                // double-counting (Python: outs[-1][:,:,-stride:] += out[:,:,:stride] - bias)
+                let prevEnd = outs[outs.count - 1]
+                let overlap = layer.strideValue
+                let prevTail = prevEnd[0..., 0..., (prevEnd.dim(2) - overlap)...]
+                var outHead = out[0..., 0..., 0..<overlap]
+                if let bias = getConvTrBias(layer) {
+                    outHead = outHead - bias.reshaped([1, -1, 1, 1])
+                }
+                let updatedPrev = concatenated([
+                    prevEnd[0..., 0..., 0..<(prevEnd.dim(2) - overlap)],
+                    prevTail + outHead
+                ], axis: 2)
+                outs[outs.count - 1] = updatedPrev
+                out = out[0..., 0..., overlap...]
+            }
+
+            if ratio >= 1.0 {
+                let halfStride = layer.strideValue / 2
+                if out.dim(2) > halfStride {
+                    out = out[0..., 0..., 0..<(out.dim(2) - halfStride), 0...]
+                }
+            }
+            if start == 0 {
+                let halfStride = layer.strideValue / 2
+                if out.dim(2) > halfStride {
+                    out = out[0..., 0..., halfStride..., 0...]
+                }
+            }
+
+            outs.append(out)
+            layer.last = savedLast
+            start = limit
+        }
+
+        var result = concatenated(outs, axis: 2)
+        if !layers[0].last {
+            result = demucsGELU(result)
+        }
+        return (result, MLXArray.zeros([1]))
     }
 }

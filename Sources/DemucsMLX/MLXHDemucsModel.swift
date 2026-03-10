@@ -16,6 +16,9 @@ struct HDemucsRuntimeConfig {
     let depth: Int
     let rewrite: Bool
     let hybrid: Bool
+    let hybridOld: Bool
+    let multiFreqs: [Float]
+    let multiFreqsDepth: Int
     let freqEmb: Float
     let embScale: Float
     let embSmooth: Bool
@@ -41,6 +44,13 @@ struct HDemucsRuntimeConfig {
         let b = ModelLoader.bool
         let d = ModelLoader.double
 
+        let multiFreqs: [Float]
+        if let arr = kwargs["multi_freqs"] as? [Any] {
+            multiFreqs = arr.compactMap { ($0 as? NSNumber)?.floatValue }
+        } else {
+            multiFreqs = []
+        }
+
         return HDemucsRuntimeConfig(
             sources: ModelLoader.sources(kwargs),
             audioChannels: i(kwargs, "audio_channels", 2),
@@ -53,6 +63,9 @@ struct HDemucsRuntimeConfig {
             depth: i(kwargs, "depth", 6),
             rewrite: b(kwargs, "rewrite", true),
             hybrid: b(kwargs, "hybrid", true),
+            hybridOld: b(kwargs, "hybrid_old", false),
+            multiFreqs: multiFreqs,
+            multiFreqsDepth: i(kwargs, "multi_freqs_depth", 2),
             freqEmb: Float(d(kwargs, "freq_emb", 0.2)),
             embScale: Float(d(kwargs, "emb_scale", 10.0)),
             embSmooth: b(kwargs, "emb_smooth", true),
@@ -82,8 +95,8 @@ final class HDemucsGraph: Module {
     let hopLength: Int
     let freqEmbScale: Float
 
-    @ModuleInfo(key: "encoder") var encoder: [HEncLayer]
-    @ModuleInfo(key: "decoder") var decoder: [HDecLayer]
+    @ModuleInfo(key: "encoder") var encoder: [Module]
+    @ModuleInfo(key: "decoder") var decoder: [Module]
     @ModuleInfo(key: "tencoder") var tencoder: [HEncLayer]
     @ModuleInfo(key: "tdecoder") var tdecoder: [HDecLayer]
 
@@ -96,10 +109,11 @@ final class HDemucsGraph: Module {
         self.hopLength = config.nFFT / 4
         self.freqEmbScale = config.freqEmb
 
-        var encoders: [HEncLayer] = []
-        var decoders: [HDecLayer] = []
+        var encoders: [Module] = []
+        var decoders: [Module] = []
         var timeEncoders: [HEncLayer] = []
         var timeDecoders: [HDecLayer] = []
+        let multiFreqs = config.multiFreqs
 
         var chin = config.audioChannels
         var chinZ = config.cac ? chin * 2 : chin
@@ -133,7 +147,7 @@ final class HDemucsGraph: Module {
                 chout = choutZ
             }
 
-            let enc = HEncLayer(
+            let encParams = HEncLayerParams(
                 inputChannels: chinZ,
                 outputChannels: choutZ,
                 kernelSize: currentKernel,
@@ -152,7 +166,31 @@ final class HDemucsGraph: Module {
                 dconvLstm: lstm,
                 dconvAttn: attn
             )
-            encoders.append(enc)
+            let useMulti = !multiFreqs.isEmpty && index < config.multiFreqsDepth
+            if useMulti {
+                encoders.append(MultiWrapEnc(params: encParams, splitRatios: multiFreqs))
+            } else {
+                let enc = HEncLayer(
+                    inputChannels: encParams.inputChannels,
+                    outputChannels: encParams.outputChannels,
+                    kernelSize: encParams.kernelSize,
+                    stride: encParams.stride,
+                    normGroups: encParams.normGroups,
+                    empty: encParams.empty,
+                    freq: encParams.freq,
+                    dconvEnabled: encParams.dconvEnabled,
+                    normEnabled: encParams.normEnabled,
+                    context: encParams.context,
+                    dconvDepth: encParams.dconvDepth,
+                    dconvComp: encParams.dconvComp,
+                    dconvInit: encParams.dconvInit,
+                    pad: encParams.pad,
+                    rewrite: encParams.rewrite,
+                    dconvLstm: encParams.dconvLstm,
+                    dconvAttn: encParams.dconvAttn
+                )
+                encoders.append(enc)
+            }
 
             if config.hybrid && freq {
                 let tenc = HEncLayer(
@@ -182,7 +220,7 @@ final class HDemucsGraph: Module {
                 chinZ = config.cac ? chin * 2 : chin
             }
 
-            let dec = HDecLayer(
+            let decParams = HDecLayerParams(
                 inputChannels: choutZ,
                 outputChannels: chinZ,
                 last: index == 0,
@@ -198,12 +236,37 @@ final class HDemucsGraph: Module {
                 dconvComp: config.dconvComp,
                 dconvInit: config.dconvInit,
                 pad: pad,
-                contextFreq: true,
+                contextFreq: !useMulti,
                 rewrite: config.rewrite,
                 dconvLstm: lstm,
                 dconvAttn: attn
             )
-            decoders.insert(dec, at: 0)
+            if useMulti {
+                decoders.insert(MultiWrapDec(params: decParams, splitRatios: multiFreqs), at: 0)
+            } else {
+                let dec = HDecLayer(
+                    inputChannels: decParams.inputChannels,
+                    outputChannels: decParams.outputChannels,
+                    last: decParams.last,
+                    kernelSize: decParams.kernelSize,
+                    stride: decParams.stride,
+                    normGroups: decParams.normGroups,
+                    empty: decParams.empty,
+                    freq: decParams.freq,
+                    dconvEnabled: decParams.dconvEnabled,
+                    normEnabled: decParams.normEnabled,
+                    context: decParams.context,
+                    dconvDepth: decParams.dconvDepth,
+                    dconvComp: decParams.dconvComp,
+                    dconvInit: decParams.dconvInit,
+                    pad: decParams.pad,
+                    contextFreq: decParams.contextFreq,
+                    rewrite: decParams.rewrite,
+                    dconvLstm: decParams.dconvLstm,
+                    dconvAttn: decParams.dconvAttn
+                )
+                decoders.insert(dec, at: 0)
+            }
 
             if config.hybrid && freq {
                 let tdec = HDecLayer(
@@ -311,7 +374,15 @@ final class HDemucsGraph: Module {
         let le = Int(ceil(Double(length) / Double(hl)))
         let pad = (hl / 2) * 3
 
-        let padded = reflectPad1D3D(x, left: pad, right: pad + le * hl - length)
+        let padded: MLXArray
+        if !config.hybridOld {
+            padded = reflectPad1D3D(x, left: pad, right: pad + le * hl - length)
+        } else {
+            // hybrid_old uses constant (zero) padding
+            var widths = [IntOrPair](repeating: 0, count: x.ndim)
+            widths[widths.count - 1] = IntOrPair((pad, pad + le * hl - length))
+            padded = MLX.padded(x, widths: widths, mode: .constant)
+        }
         var z = spectral.stft(padded)
 
         z = DemucsComplexSpectrogram(
@@ -346,7 +417,16 @@ final class HDemucsGraph: Module {
         let le = hl * Int(ceil(Double(length) / Double(hl))) + 2 * pad
 
         var x = spectral.istft(DemucsComplexSpectrogram(real: real, imag: imag), length: le)
-        x = x[0..., 0..., 0..., pad..<(pad + length)]
+
+        // Trim to original length - handle both 3D [B,C,T] and 4D [B,S,C,T] outputs
+        // hybrid_old=True: zero padding → trim from (pad + hl) to align with original signal
+        // hybrid_old=False: reflect padding → trim from pad (verified working)
+        let trimStart = config.hybridOld ? (pad + hl) : pad
+        if x.ndim == 4 {
+            x = x[0..., 0..., 0..., trimStart..<(trimStart + length)]
+        } else {
+            x = x[0..., 0..., trimStart..<(trimStart + length)]
+        }
         return x
     }
 
@@ -374,7 +454,14 @@ final class HDemucsGraph: Module {
                 imag: parts[1].squeezed(axis: 5)
             )
         }
-        return DemucsComplexSpectrogram(real: z.real, imag: z.imag)
+        // cac=False, wiener_iters=0, softmask=False: apply mix phase to predicted magnitudes.
+        // m is [B, S, C, Fr, T] (predicted magnitudes), z is complex [B, C, Fr, T].
+        // Matches OpenUnmix wiener() with iterations=0: y = magnitude * exp(i * angle(mix))
+        let angle = MLX.atan2(z.imag, z.real).expandedDimensions(axis: 1)  // [B, 1, C, Fr, T]
+        return DemucsComplexSpectrogram(
+            real: m * cos(angle),  // [B, S, C, Fr, T]
+            imag: m * sin(angle)
+        )
     }
 
     // MARK: - Forward Pass
@@ -384,6 +471,7 @@ final class HDemucsGraph: Module {
 
         // Spectral analysis
         let z = spec(mix)
+
         var x = magnitude(z)
 
         let b = x.dim(0)
@@ -413,6 +501,7 @@ final class HDemucsGraph: Module {
         // Encoder
         for idx in 0..<encoder.count {
             lengths.append(x.dim(-1))
+            let enc = encoder[idx] as! HEncoderLayer
 
             var inject: MLXArray? = nil
             if config.hybrid && idx < tencoder.count {
@@ -426,7 +515,7 @@ final class HDemucsGraph: Module {
                 }
             }
 
-            x = encoder[idx](x, inject: inject)
+            x = enc(x, inject: inject)
 
             if idx == 0, let freqEmbMod = freqEmb {
                 let frs = MLXArray(0..<x.dim(-2)).asType(.int32)
@@ -444,13 +533,13 @@ final class HDemucsGraph: Module {
         if config.hybrid {
             xt = MLXArray.zeros(like: xt)
         }
-
         // Decoder
         let offset = config.depth - tdecoder.count
         for idx in 0..<decoder.count {
             let skip = saved.removeLast()
             let length = lengths.removeLast()
-            let decoded = decoder[idx](x, skip: skip, length: length)
+            let dec = decoder[idx] as! HDecoderLayer
+            let decoded = dec(x, skip: skip, length: length)
             x = decoded.0
             let pre = decoded.1
 

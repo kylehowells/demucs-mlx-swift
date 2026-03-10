@@ -54,7 +54,12 @@ enum DemucsModelFactory {
     ) throws -> StemSeparationModel {
         let numModels = ModelLoader.int(config, "num_models", 1)
         let bagWeights = config["weights"] as? [Any]
-        let subModelClass = config["sub_model_class"] as? String ?? "HTDemucsMLX"
+        let defaultSubModelClass = config["sub_model_class"] as? String ?? "HTDemucsMLX"
+
+        // Per-model class array for heterogeneous bags (e.g., mdx = 2×Demucs + 2×HDemucs)
+        let subModelClasses = config["sub_model_classes"] as? [String]
+        // Per-model config with kwargs
+        let modelConfigs = config["model_configs"] as? [[String: Any]]
 
         let allWeights = try ModelLoader.loadWeights(from: directory, modelName: descriptor.name)
 
@@ -71,10 +76,25 @@ enum DemucsModelFactory {
                 }
             }
 
-            let subConfig = configForSubModel(config, modelClass: subModelClass)
+            // Determine model class for this sub-model
+            let modelClass: String
+            if let classes = subModelClasses, i < classes.count {
+                modelClass = classes[i]
+            } else {
+                modelClass = defaultSubModelClass
+            }
+
+            // Build per-model config: use model_configs[i].kwargs if available, else fall back to bag-level kwargs
+            let subConfig: [String: Any]
+            if let configs = modelConfigs, i < configs.count {
+                subConfig = configs[i]["kwargs"] as? [String: Any] ?? config
+            } else {
+                subConfig = config["kwargs"] as? [String: Any] ?? config
+            }
+
             let model = try buildModelGraph(
                 descriptor: descriptor,
-                modelClass: subModelClass,
+                modelClass: modelClass,
                 config: subConfig,
                 weights: subWeights
             )
@@ -97,12 +117,6 @@ enum DemucsModelFactory {
             models: subModels,
             weights: weightVectors.isEmpty ? nil : weightVectors
         )
-    }
-
-    /// Extract kwargs for sub-model from bag config.
-    private static func configForSubModel(_ config: [String: Any], modelClass: String) -> [String: Any] {
-        // The kwargs in the bag config are the sub-model kwargs
-        return config
     }
 
     // MARK: - Single Model Builder
@@ -222,10 +236,18 @@ enum DemucsModelFactory {
     }
 }
 
+// MARK: - GPU-native predict protocol
+
+/// Optional GPU-native predict for models that can stay on GPU.
+/// Used by BagOfModels to avoid CPU↔GPU roundtrips between sub-models.
+protocol GPUPredictable {
+    func predictGPU(input: MLXArray) -> MLXArray
+}
+
 // MARK: - Lightweight Wrappers
 
 /// Wraps an HTDemucsGraph as a StemSeparationModel.
-final class HTDemucsModelWrapper: StemSeparationModel {
+final class HTDemucsModelWrapper: StemSeparationModel, GPUPredictable {
     let descriptor: DemucsModelDescriptor
     private let graph: HTDemucsGraph
 
@@ -234,16 +256,20 @@ final class HTDemucsModelWrapper: StemSeparationModel {
         self.graph = graph
     }
 
+    func predictGPU(input: MLXArray) -> MLXArray {
+        graph(input)
+    }
+
     func predict(batchData: [Float], batchSize: Int, channels: Int, frames: Int) throws -> [Float] {
         let input = MLXArray(batchData).reshaped([batchSize, channels, frames])
-        let output = graph(input)
+        let output = predictGPU(input: input)
         MLX.eval(output)
         return output.asArray(Float.self)
     }
 }
 
 /// Wraps an HDemucsGraph as a StemSeparationModel.
-final class HDemucsModelWrapper: StemSeparationModel {
+final class HDemucsModelWrapper: StemSeparationModel, GPUPredictable {
     let descriptor: DemucsModelDescriptor
     private let graph: HDemucsGraph
 
@@ -252,16 +278,20 @@ final class HDemucsModelWrapper: StemSeparationModel {
         self.graph = graph
     }
 
+    func predictGPU(input: MLXArray) -> MLXArray {
+        graph(input)
+    }
+
     func predict(batchData: [Float], batchSize: Int, channels: Int, frames: Int) throws -> [Float] {
         let input = MLXArray(batchData).reshaped([batchSize, channels, frames])
-        let output = graph(input)
+        let output = predictGPU(input: input)
         MLX.eval(output)
         return output.asArray(Float.self)
     }
 }
 
 /// Wraps a DemucsGraph as a StemSeparationModel.
-final class DemucsModelWrapper: StemSeparationModel {
+final class DemucsModelWrapper: StemSeparationModel, GPUPredictable {
     let descriptor: DemucsModelDescriptor
     private let graph: DemucsGraph
 
@@ -270,9 +300,13 @@ final class DemucsModelWrapper: StemSeparationModel {
         self.graph = graph
     }
 
+    func predictGPU(input: MLXArray) -> MLXArray {
+        graph(input)
+    }
+
     func predict(batchData: [Float], batchSize: Int, channels: Int, frames: Int) throws -> [Float] {
         let input = MLXArray(batchData).reshaped([batchSize, channels, frames])
-        let output = graph(input)
+        let output = predictGPU(input: input)
         MLX.eval(output)
         return output.asArray(Float.self)
     }

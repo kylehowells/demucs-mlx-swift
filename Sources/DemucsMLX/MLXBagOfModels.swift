@@ -1,4 +1,5 @@
 import Foundation
+import MLX
 
 /// Ensemble model that runs multiple sub-models and averages their outputs
 /// with per-source weights.
@@ -48,50 +49,50 @@ final class BagOfModels: StemSeparationModel {
         frames: Int
     ) throws -> [Float] {
         let sourceCount = descriptor.sourceNames.count
-        let outputSize = batchSize * sourceCount * channels * frames
+        let input = MLXArray(batchData).reshaped([batchSize, channels, frames])
 
-        var accumulated = [Float](repeating: 0.0, count: outputSize)
+        // Accumulate on GPU to avoid CPU↔GPU transfers between sub-models
+        var accumulated: MLXArray? = nil
 
         for (modelIdx, model) in models.enumerated() {
-            let output = try model.predict(
-                batchData: batchData,
-                batchSize: batchSize,
-                channels: channels,
-                frames: frames
-            )
-
             let w = weights[modelIdx]
 
-            // Weighted accumulation per-source
-            for b in 0..<batchSize {
-                for s in 0..<sourceCount {
-                    let weight = w[s]
-                    if weight == 0 { continue }
-                    for c in 0..<channels {
-                        for t in 0..<frames {
-                            let idx = ((b * sourceCount + s) * channels + c) * frames + t
-                            accumulated[idx] += output[idx] * weight
-                        }
-                    }
-                }
+            // Create weight tensor: [1, S, 1, 1] for broadcasting
+            let weightArray = MLXArray(w).reshaped([1, sourceCount, 1, 1])
+
+            let output: MLXArray
+            if let gpuModel = model as? GPUPredictable {
+                output = gpuModel.predictGPU(input: input)
+            } else {
+                // Fallback: go through [Float]
+                let floatOutput = try model.predict(
+                    batchData: batchData,
+                    batchSize: batchSize,
+                    channels: channels,
+                    frames: frames
+                )
+                output = MLXArray(floatOutput).reshaped([batchSize, sourceCount, channels, frames])
+            }
+
+            // output shape: [B, S, C, T]
+            let weighted = output * weightArray
+
+            if let acc = accumulated {
+                accumulated = acc + weighted
+            } else {
+                accumulated = weighted
             }
         }
 
-        // Normalize by total weight per source
-        for b in 0..<batchSize {
-            for s in 0..<sourceCount {
-                let total = totals[s]
-                if total <= 0 { continue }
-                let invTotal = 1.0 / total
-                for c in 0..<channels {
-                    for t in 0..<frames {
-                        let idx = ((b * sourceCount + s) * channels + c) * frames + t
-                        accumulated[idx] *= invTotal
-                    }
-                }
-            }
+        guard let result = accumulated else {
+            return [Float](repeating: 0, count: batchSize * sourceCount * channels * frames)
         }
 
-        return accumulated
+        // Normalize by total weight per source: [1, S, 1, 1]
+        let totalArray = MLXArray(totals).reshaped([1, sourceCount, 1, 1])
+        let normalized = result / MLX.maximum(totalArray, MLXArray(Float(1e-8)))
+
+        MLX.eval(normalized)
+        return normalized.asArray(Float.self)
     }
 }

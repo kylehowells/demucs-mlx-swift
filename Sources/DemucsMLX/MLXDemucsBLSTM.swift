@@ -94,18 +94,26 @@ final class DemucsBLSTM: Module, DemucsUnaryLayer {
         return result
     }
 
-    /// Extract overlapping frames from input.
+    /// Extract overlapping frames from input (with padding to cover the full sequence).
     /// Input: (B, C, T), output: (B, C, nframes, width)
     private func unfold(_ x: MLXArray, width: Int, stride: Int) -> MLXArray {
         let t = x.dim(2)
-        let nframes = max(0, (t - width) / stride + 1)
+        let nframes = Int(ceil(Double(t) / Double(stride)))
+        let targetLength = (nframes - 1) * stride + width
+        let pad = targetLength - t
+
+        var padded = x
+        if pad > 0 {
+            let widths: [IntOrPair] = [0, 0, IntOrPair((0, pad))]
+            padded = MLX.padded(x, widths: widths, mode: .constant)
+        }
 
         var frames: [MLXArray] = []
         frames.reserveCapacity(nframes)
         for i in 0..<nframes {
             let start = i * stride
             let end = start + width
-            frames.append(x[0..., 0..., start..<end])
+            frames.append(padded[0..., 0..., start..<end])
         }
         return stacked(frames, axis: 2)
     }

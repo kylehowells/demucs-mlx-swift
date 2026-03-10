@@ -28,7 +28,7 @@ final class DemucsLocalState: Module, DemucsUnaryLayer {
         self._key_.wrappedValue = Conv1dNCL(channels, channels, kernelSize: 1)
 
         let projInChannels = channels + heads * nfreqs
-        self._proj.wrappedValue = Conv1dNCL(projInChannels, channels, kernelSize: 1, bias: false)
+        self._proj.wrappedValue = Conv1dNCL(projInChannels, channels, kernelSize: 1)
 
         if nfreqs > 0 {
             self._queryFreqs.wrappedValue = Conv1dNCL(channels, heads * nfreqs, kernelSize: 1)
@@ -94,9 +94,10 @@ final class DemucsLocalState: Module, DemucsUnaryLayer {
         let weights = softmax(dots, axis: 2)
 
         // Apply attention to content
+        // PyTorch: result[b,h,c,s] = sum_t(weights[b,h,t,s] * content[b,h,c,t])
+        // matmul(content, weights): (B,H,C/H,T) @ (B,H,T_key,T_query) = (B,H,C/H,T_query)
         let contentVal = content(x).reshaped([b, heads, perHead, t])
-        let contentT = contentVal.transposed(0, 1, 3, 2)
-        var result = matmul(weights, contentT).transposed(0, 1, 3, 2)
+        var result = matmul(contentVal, weights)
 
         // Optional frequency signatures
         if nfreqs > 0 {

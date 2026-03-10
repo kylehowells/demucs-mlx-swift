@@ -109,6 +109,32 @@ def export_checkpoint(ck_path: Path, out_dir: Path, model_name: str) -> bool:
         "tensor_count": len(flat),
     }
 
+    # For heterogeneous bags, include per-model class and kwargs
+    per_model_class = checkpoint.get("per_model_class")
+    per_model_kwargs = checkpoint.get("per_model_kwargs")
+
+    if per_model_class:
+        # Map PyTorch class names to MLX class names
+        class_map = {
+            'Demucs': 'DemucsMLX',
+            'HDemucs': 'HDemucsMLX',
+            'HTDemucs': 'HTDemucsMLX',
+        }
+        metadata["sub_model_classes"] = [class_map.get(c, c) for c in per_model_class]
+
+    if per_model_kwargs:
+        # Build model_configs array with per-model class + kwargs
+        model_configs = []
+        for i, kw in enumerate(per_model_kwargs):
+            mc = "HTDemucsMLX"
+            if per_model_class and i < len(per_model_class):
+                mc = class_map.get(per_model_class[i], per_model_class[i])
+            model_configs.append({
+                "model_class": mc,
+                "kwargs": to_builtin(kw),
+            })
+        metadata["model_configs"] = model_configs
+
     # Remove None values for cleaner JSON
     metadata = {k: v for k, v in metadata.items() if v is not None}
 
