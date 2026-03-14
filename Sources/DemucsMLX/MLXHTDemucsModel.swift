@@ -458,8 +458,16 @@ final class HTDemucsGraph: Module {
     }
 
     func callAsFunction(_ mix: MLXArray) -> MLXArray {
+        try! forward(mix, monitor: nil)
+    }
+
+    func forward(_ mix: MLXArray, monitor: SeparationMonitor?) throws -> MLXArray {
         let profilingEnabled = ProcessInfo.processInfo.environment["DEMUCS_MLX_SWIFT_PROFILE"] == "1"
         let tStart = profilingEnabled ? CFAbsoluteTimeGetCurrent() : 0
+
+        // Sub-step progress: STFT + encoder×depth + transformer×tLayers + decoder×depth + output
+        let totalSteps = Float(1 + config.depth + config.tLayers + config.depth + 1)
+        var step: Float = 0
 
         var mix = mix
         let originalLength = mix.dim(-1)
@@ -472,6 +480,9 @@ final class HTDemucsGraph: Module {
             let widths: [IntOrPair] = [0, 0, IntOrPair((0, padRight))]
             mix = padded(mix, widths: widths, mode: .constant)
         }
+
+        monitor?.reportProgress(0, stage: "STFT")
+        try monitor?.checkCancellation()
 
         let z = spec(mix)
         let tAfterSpec = profilingEnabled ? CFAbsoluteTimeGetCurrent() : 0
@@ -491,7 +502,11 @@ final class HTDemucsGraph: Module {
         var lengths: [Int] = []
         var lengthsT: [Int] = []
 
+        step = 1
         for idx in 0..<encoder.count {
+            monitor?.reportProgress(step / totalSteps, stage: "Encoder \(idx + 1)/\(config.depth)")
+            try monitor?.checkCancellation()
+
             lengths.append(x.dim(-1))
             lengthsT.append(xt.dim(-1))
 
@@ -508,9 +523,13 @@ final class HTDemucsGraph: Module {
             }
 
             saved.append(x)
+            step += 1
         }
 
+        try monitor?.checkCancellation()
+
         if config.tLayers > 0 {
+            let tMonitor = monitor?.scoped(start: step / totalSteps, end: (step + Float(config.tLayers)) / totalSteps)
             if config.bottomChannels > 0 {
                 let b = x.dim(0)
                 let c = x.dim(1)
@@ -522,7 +541,7 @@ final class HTDemucsGraph: Module {
                 x = x.reshaped([b, config.bottomChannels, f, t])
                 xt = channelUpsamplerT!(xt)
 
-                let out = crosstransformer(x, xt)
+                let out = try crosstransformer.forward(x, xt, monitor: tMonitor)
                 x = out.0
                 xt = out.1
 
@@ -530,16 +549,21 @@ final class HTDemucsGraph: Module {
                 x = channelDownsampler!(x)
                 x = x.reshaped([b, c, f, t])
                 xt = channelDownsamplerT!(xt)
-            } else {
-                let out = crosstransformer(x, xt)
+            }
+            else {
+                let out = try crosstransformer.forward(x, xt, monitor: tMonitor)
                 x = out.0
                 xt = out.1
             }
+            step += Float(config.tLayers)
         }
         let tAfterCore = profilingEnabled ? CFAbsoluteTimeGetCurrent() : 0
 
         let offset = config.depth - tdecoder.count
         for idx in 0..<decoder.count {
+            monitor?.reportProgress(step / totalSteps, stage: "Decoder \(idx + 1)/\(config.depth)")
+            try monitor?.checkCancellation()
+
             let skip = saved.removeLast()
             let length = lengths.removeLast()
             let decoded = decoder[idx](x, skip: skip, length: length)
@@ -551,7 +575,11 @@ final class HTDemucsGraph: Module {
                 let tdecoded = tdecoder[idx - offset](xt, skip: skipT, length: lengthT)
                 xt = tdecoded.0
             }
+            step += 1
         }
+
+        monitor?.reportProgress(step / totalSteps, stage: "Output")
+        try monitor?.checkCancellation()
 
         let b = x.dim(0)
         let s = config.sources.count
@@ -574,7 +602,8 @@ final class HTDemucsGraph: Module {
         if xWave.dim(-1) != xt.dim(-1) {
             if xWave.dim(-1) > xt.dim(-1) {
                 xWave = demucsCenterTrim(xWave, referenceLength: xt.dim(-1))
-            } else {
+            }
+            else {
                 xt = demucsCenterTrim(xt, referenceLength: xWave.dim(-1))
             }
         }
@@ -650,10 +679,11 @@ final class NativeHTDemucsModel: StemSeparationModel {
         batchData: [Float],
         batchSize: Int,
         channels: Int,
-        frames: Int
+        frames: Int,
+        monitor: SeparationMonitor? = nil
     ) throws -> [Float] {
         let input = MLXArray(batchData).reshaped([batchSize, channels, frames])
-        let output = graph(input)
+        let output = try graph.forward(input, monitor: monitor)
         MLX.eval(output)
         return output.asArray(Float.self)
     }

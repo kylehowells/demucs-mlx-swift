@@ -4,7 +4,7 @@ import Foundation
 import MLX
 #endif
 
-public struct DemucsAudio {
+public struct DemucsAudio: Sendable {
     public let channelMajorSamples: [Float]
     public let channels: Int
     public let sampleRate: Int
@@ -47,12 +47,12 @@ extension DemucsAudio {
 }
 #endif
 
-public struct DemucsSeparationResult {
+public struct DemucsSeparationResult: Sendable {
     public let input: DemucsAudio
     public let stems: [String: DemucsAudio]
 }
 
-public struct DemucsSeparationParameters {
+public struct DemucsSeparationParameters: Sendable {
     public var shifts: Int
     public var overlap: Float
     public var split: Bool

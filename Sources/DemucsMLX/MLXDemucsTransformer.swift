@@ -261,6 +261,10 @@ final class CrossTransformerEncoder: Module {
     }
 
     func callAsFunction(_ xIn: MLXArray, _ xtIn: MLXArray) -> (MLXArray, MLXArray) {
+        try! forward(xIn, xtIn, monitor: nil)
+    }
+
+    func forward(_ xIn: MLXArray, _ xtIn: MLXArray, monitor: SeparationMonitor?) throws -> (MLXArray, MLXArray) {
         let b = xIn.dim(0)
         let c = xIn.dim(1)
         let f = xIn.dim(2)
@@ -283,10 +287,14 @@ final class CrossTransformerEncoder: Module {
         xt = normInT(xt) + MLXArray(weightPosEmbed) * p1d
 
         for idx in 0..<numLayers {
+            monitor?.reportProgress(Float(idx) / Float(numLayers), stage: "Transformer \(idx + 1)/\(numLayers)")
+            try monitor?.checkCancellation()
+
             if idx % 2 == classicParity {
                 x = layers[idx](x)
                 xt = layersT[idx](xt)
-            } else {
+            }
+            else {
                 let oldX = x
                 x = layers[idx](x, other: xt)
                 xt = layersT[idx](xt, other: oldX)

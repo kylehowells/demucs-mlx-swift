@@ -1,6 +1,6 @@
 import Foundation
 
-public final class DemucsSeparator {
+public final class DemucsSeparator: @unchecked Sendable {
     public let modelName: String
     public let descriptor: DemucsModelDescriptor
 
@@ -41,7 +41,112 @@ public final class DemucsSeparator {
     }
 
     public func separate(audio: DemucsAudio) throws -> DemucsSeparationResult {
+        return try self.separate(audio: audio, monitor: nil)
+    }
+
+    // MARK: - Closure-Based Async API
+
+    /// The internal serial queue used for background separation work.
+    private static let separationQueue = DispatchQueue(label: "com.demucs.separation", qos: .userInitiated)
+
+    /// Separate an audio file into stems on a background queue.
+    ///
+    /// - Parameters:
+    ///   - url: Path to the audio file to separate.
+    ///   - cancelToken: Optional token to request cancellation. Call `cancel()` on it to stop.
+    ///   - progress: Optional progress callback. Called on the **main queue**.
+    ///   - completion: Called on the **main queue** with the result or error.
+    public func separate(
+        fileAt url: URL,
+        cancelToken: DemucsCancelToken?,
+        progress: (@Sendable (_ progress: DemucsSeparationProgress) -> Void)?,
+        completion: @escaping @Sendable (_ result: Result<DemucsSeparationResult, Error>) -> Void
+    ) {
+        let progressCopy = progress
+        let completionCopy = completion
+        DemucsSeparator.separationQueue.async(execute: { [self] in
+            let result: Result<DemucsSeparationResult, Error>
+
+            // Create interpolator for smooth progress during GPU batch gaps
+            let interpolator: ProgressInterpolator?
+            if let progressCopy {
+                interpolator = ProgressInterpolator(callback: progressCopy)
+            } else {
+                interpolator = nil
+            }
+
+            do {
+                let audio = try AudioIO.loadAudio(from: url)
+                let monitor = SeparationMonitor(
+                    cancelToken: cancelToken,
+                    progressHandler: { fraction, stage in
+                        interpolator?.onProgress(fraction, stage: stage)
+                    }
+                )
+                let separationResult = try self.separate(audio: audio, monitor: monitor)
+                result = .success(separationResult)
+            }
+            catch {
+                result = .failure(error)
+            }
+            interpolator?.stop()
+            DispatchQueue.main.async(execute: {
+                completionCopy(result)
+            })
+        })
+    }
+
+    /// Separate audio into stems on a background queue.
+    ///
+    /// - Parameters:
+    ///   - audio: The audio data to separate.
+    ///   - cancelToken: Optional token to request cancellation.
+    ///   - progress: Optional progress callback. Called on the **main queue**.
+    ///   - completion: Called on the **main queue** with the result or error.
+    public func separate(
+        audio: DemucsAudio,
+        cancelToken: DemucsCancelToken?,
+        progress: (@Sendable (_ progress: DemucsSeparationProgress) -> Void)?,
+        completion: @escaping @Sendable (_ result: Result<DemucsSeparationResult, Error>) -> Void
+    ) {
+        let progressCopy = progress
+        let completionCopy = completion
+        DemucsSeparator.separationQueue.async(execute: { [self] in
+            let result: Result<DemucsSeparationResult, Error>
+
+            let interpolator: ProgressInterpolator?
+            if let progressCopy {
+                interpolator = ProgressInterpolator(callback: progressCopy)
+            } else {
+                interpolator = nil
+            }
+
+            do {
+                let monitor = SeparationMonitor(
+                    cancelToken: cancelToken,
+                    progressHandler: { fraction, stage in
+                        interpolator?.onProgress(fraction, stage: stage)
+                    }
+                )
+                let separationResult = try self.separate(audio: audio, monitor: monitor)
+                result = .success(separationResult)
+            }
+            catch {
+                result = .failure(error)
+            }
+            interpolator?.stop()
+            DispatchQueue.main.async(execute: {
+                completionCopy(result)
+            })
+        })
+    }
+
+    // MARK: - Internal
+
+    private func separate(audio: DemucsAudio, monitor: SeparationMonitor?) throws -> DemucsSeparationResult {
         let validated = try parameters.validated()
+
+        try monitor?.checkCancellation()
 
         let input = audio.channelMajorSamples
         let remixed = AudioDSP.remixChannels(
@@ -65,13 +170,19 @@ public final class DemucsSeparator {
             sampleRate: descriptor.sampleRate
         )
 
-        let engine = SeparationEngine(model: model, parameters: validated)
+        try monitor?.checkCancellation()
+        monitor?.reportProgress(0.0, stage: "Starting separation")
+
+        let engine = SeparationEngine(model: model, parameters: validated, monitor: monitor)
         let stemsFlat = try engine.separate(
             mix: resampled.samples,
             channels: descriptor.audioChannels,
             frames: resampled.frames,
             sampleRate: descriptor.sampleRate
         )
+
+        try monitor?.checkCancellation()
+        monitor?.reportProgress(1.0, stage: "Complete")
 
         var stems: [String: DemucsAudio] = [:]
         for (sourceIndex, sourceName) in descriptor.sourceNames.enumerated() {

@@ -46,7 +46,8 @@ final class BagOfModels: StemSeparationModel {
         batchData: [Float],
         batchSize: Int,
         channels: Int,
-        frames: Int
+        frames: Int,
+        monitor: SeparationMonitor? = nil
     ) throws -> [Float] {
         let sourceCount = descriptor.sourceNames.count
         let input = MLXArray(batchData).reshaped([batchSize, channels, frames])
@@ -55,6 +56,8 @@ final class BagOfModels: StemSeparationModel {
         var accumulated: MLXArray? = nil
 
         for (modelIdx, model) in models.enumerated() {
+            try monitor?.checkCancellation()
+
             let w = weights[modelIdx]
 
             // Create weight tensor: [1, S, 1, 1] for broadcasting
@@ -62,14 +65,16 @@ final class BagOfModels: StemSeparationModel {
 
             let output: MLXArray
             if let gpuModel = model as? GPUPredictable {
-                output = gpuModel.predictGPU(input: input)
-            } else {
+                output = try gpuModel.predictGPU(input: input, monitor: monitor)
+            }
+            else {
                 // Fallback: go through [Float]
                 let floatOutput = try model.predict(
                     batchData: batchData,
                     batchSize: batchSize,
                     channels: channels,
-                    frames: frames
+                    frames: frames,
+                    monitor: monitor
                 )
                 output = MLXArray(floatOutput).reshaped([batchSize, sourceCount, channels, frames])
             }
@@ -79,12 +84,14 @@ final class BagOfModels: StemSeparationModel {
 
             if let acc = accumulated {
                 accumulated = acc + weighted
-            } else {
+            }
+            else {
                 accumulated = weighted
             }
         }
 
-        guard let result = accumulated else {
+        guard let result = accumulated
+        else {
             return [Float](repeating: 0, count: batchSize * sourceCount * channels * frames)
         }
 

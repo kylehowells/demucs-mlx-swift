@@ -11,7 +11,8 @@ final class HeuristicDemucsModel: StemSeparationModel {
         batchData input: [Float],
         batchSize: Int,
         channels: Int,
-        frames: Int
+        frames: Int,
+        monitor: SeparationMonitor? = nil
     ) throws -> [Float] {
         let sourceCount = descriptor.sourceNames.count
 

@@ -45,6 +45,12 @@ public struct DemucsCLI: ParsableCommand {
     @Flag(name: .customLong("list-models"), help: "List available models")
     public var listModels: Bool = false
 
+    @Flag(name: .customLong("async"), help: "Use the closure-based async API with progress reporting")
+    public var useAsync: Bool = false
+
+    @Option(name: .customLong("cancel-after"), help: "Cancel separation after N seconds (for testing cancellation)")
+    public var cancelAfter: Double?
+
     // MARK: Output format options
 
     @Flag(name: .customLong("mp3"), help: "Output as AAC in .m4a (Apple's lossy equivalent of MP3)")
@@ -88,8 +94,11 @@ public struct DemucsCLI: ParsableCommand {
             seed: seed
         )
 
+        print("Loading model '\(name)'...")
         let modelDirectoryURL = modelDir.map { URL(fileURLWithPath: $0, isDirectory: true) }
         let separator = try DemucsSeparator(modelName: name, parameters: params, modelDirectory: modelDirectoryURL)
+        print("Model loaded. Sources: \(separator.sources.joined(separator: ", "))")
+
         let outputRoot = URL(fileURLWithPath: out, isDirectory: true)
         try FileManager.default.createDirectory(at: outputRoot, withIntermediateDirectories: true)
 
@@ -105,15 +114,28 @@ public struct DemucsCLI: ParsableCommand {
 
         for track in tracks {
             let inputURL = URL(fileURLWithPath: track)
-            print("Separating: \(inputURL.path)")
+            print("\nSeparating: \(inputURL.path)")
 
-            let result = try separator.separate(fileAt: inputURL)
+            let start = CFAbsoluteTimeGetCurrent()
+
+            let result: DemucsSeparationResult
+            if useAsync || cancelAfter != nil {
+                result = try Self.separateAsync(separator: separator, inputURL: inputURL, cancelAfterSeconds: cancelAfter)
+            }
+            else {
+                result = try separator.separate(fileAt: inputURL)
+            }
+
+            let elapsed = CFAbsoluteTimeGetCurrent() - start
+            print(String(format: "Separation complete (%.2fs)", elapsed))
+
             let trackDir = outputRoot.appendingPathComponent(inputURL.deletingPathExtension().lastPathComponent, isDirectory: true)
             try FileManager.default.createDirectory(at: trackDir, withIntermediateDirectories: true)
 
             if let stem = twoStems {
                 // Two-stem mode: write the selected stem and its complement
-                guard let selectedAudio = result.stems[stem] else { continue }
+                guard let selectedAudio = result.stems[stem]
+                else { continue }
 
                 // Write the selected stem
                 let stemURL = trackDir.appendingPathComponent("\(stem).\(fileExtension)", isDirectory: false)
@@ -124,7 +146,7 @@ public struct DemucsCLI: ParsableCommand {
                 let mixSamples = result.input.channelMajorSamples
                 let stemSamples = selectedAudio.channelMajorSamples
                 var complementSamples = [Float](repeating: 0, count: mixSamples.count)
-                for i in 0..<mixSamples.count {
+                for i in 0 ..< mixSamples.count {
                     complementSamples[i] = mixSamples[i] - stemSamples[i]
                 }
 
@@ -137,16 +159,111 @@ public struct DemucsCLI: ParsableCommand {
                 let complementURL = trackDir.appendingPathComponent("no_\(stem).\(fileExtension)", isDirectory: false)
                 try AudioIO.writeAudio(complementAudio, to: complementURL, format: outputFormat)
                 print("  wrote \(complementURL.path)")
-            } else {
+            }
+            else {
                 // Normal mode: write all stems
                 for source in separator.sources {
-                    guard let stemAudio = result.stems[source] else { continue }
+                    guard let stemAudio = result.stems[source]
+                    else { continue }
+
                     let stemURL = trackDir.appendingPathComponent("\(source).\(fileExtension)", isDirectory: false)
                     try AudioIO.writeAudio(stemAudio, to: stemURL, format: outputFormat)
                     print("  wrote \(stemURL.path)")
                 }
             }
         }
+    }
+
+    // MARK: - Async Separation
+
+    /// Thread-safe box for mutable state shared across closures.
+    private final class AsyncState: @unchecked Sendable {
+        private let lock = NSLock()
+        var result: Result<DemucsSeparationResult, Error>?
+        var lastProgressLineLength: Int = 0
+
+        func setResult(_ value: Result<DemucsSeparationResult, Error>) {
+            self.lock.lock()
+            self.result = value
+            self.lock.unlock()
+        }
+
+        func getResult() -> Result<DemucsSeparationResult, Error>? {
+            self.lock.lock()
+            defer { self.lock.unlock() }
+            return self.result
+        }
+    }
+
+    /// Use the closure-based async API with progress reporting.
+    /// Blocks the calling thread until the separation completes.
+    private static func separateAsync(separator: DemucsSeparator, inputURL: URL, cancelAfterSeconds: Double? = nil) throws -> DemucsSeparationResult {
+        let semaphore = DispatchSemaphore(value: 0)
+        let state = AsyncState()
+        let cancelToken = DemucsCancelToken()
+
+        // Schedule cancellation after a delay if requested
+        if let delay = cancelAfterSeconds {
+            print("  Will cancel after \(delay)s...")
+            DispatchQueue.global().asyncAfter(deadline: .now() + delay, execute: {
+                print("\n  Cancelling separation...")
+                cancelToken.cancel()
+            })
+        }
+
+        separator.separate(
+            fileAt: inputURL,
+            cancelToken: cancelToken,
+            progress: { progress in
+                // Called on main queue - print progress
+                let percent = Int(progress.fraction * 100)
+                let bar = progressBar(fraction: progress.fraction, width: 30)
+                let etaStr: String
+                if let eta = progress.estimatedTimeRemaining, eta > 0 && progress.fraction < 1.0 {
+                    let mins = Int(eta) / 60
+                    let secs = Int(eta) % 60
+                    etaStr = mins > 0 ? " ETA \(mins)m\(String(format: "%02d", secs))s" : " ETA \(secs)s"
+                } else {
+                    etaStr = ""
+                }
+                let line = "\r  [\(bar)] \(percent)% - \(progress.stage)\(etaStr)"
+                let padded = line.padding(toLength: max(line.count, state.lastProgressLineLength), withPad: " ", startingAt: 0)
+                print(padded, terminator: "")
+                fflush(stdout)
+                state.lastProgressLineLength = line.count
+
+                if ProcessInfo.processInfo.environment["DEMUCS_BENCH"] != nil {
+                    fputs("PROGRESS_TS \(CFAbsoluteTimeGetCurrent()) \(progress.fraction) \(progress.stage)\n", stderr)
+                }
+            },
+            completion: { result in
+                // Called on main queue
+                state.setResult(result)
+                semaphore.signal()
+            }
+        )
+
+        // Run the main run loop so that main-queue callbacks can fire
+        while semaphore.wait(timeout: .now() + 0.05) == .timedOut {
+            RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.05))
+        }
+
+        // Clear the progress line
+        print("")
+
+        guard let result = state.getResult()
+        else {
+            throw DemucsError.cancelled
+        }
+
+        return try result.get()
+    }
+
+    /// Render a simple ASCII progress bar.
+    private static func progressBar(fraction: Float, width: Int) -> String {
+        let filled = Int(fraction * Float(width))
+        let empty = width - filled
+        return String(repeating: "=", count: filled) + String(repeating: " ", count: empty)
     }
 
     // MARK: - Format resolution
@@ -189,9 +306,11 @@ public struct DemucsCLI: ParsableCommand {
         let bitDepth: WAVBitDepth
         if int24 {
             bitDepth = .int24
-        } else if float32 {
+        }
+        else if float32 {
             bitDepth = .float32
-        } else {
+        }
+        else {
             bitDepth = .int16
         }
         return (.wav(bitDepth: bitDepth), "wav")

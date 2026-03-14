@@ -7,6 +7,7 @@ public enum DemucsError: Error, LocalizedError {
     case invalidParameter(String)
     case unsupportedModelBackend(String)
     case audioIO(String)
+    case cancelled
 
     public var errorDescription: String? {
         switch self {
@@ -22,6 +23,8 @@ public enum DemucsError: Error, LocalizedError {
             return "Unsupported model backend: \(reason)"
         case .audioIO(let reason):
             return "Audio I/O error: \(reason)"
+        case .cancelled:
+            return "Separation was cancelled."
         }
     }
 }

@@ -2,7 +2,7 @@ import Foundation
 import MLX
 import MLXNN
 
-public protocol StemSeparationModel {
+protocol StemSeparationModel {
     var descriptor: DemucsModelDescriptor { get }
 
     /// Input shape: [batch, channels, frames] (flattened channel-major per batch item).
@@ -11,7 +11,8 @@ public protocol StemSeparationModel {
         batchData: [Float],
         batchSize: Int,
         channels: Int,
-        frames: Int
+        frames: Int,
+        monitor: SeparationMonitor?
     ) throws -> [Float]
 }
 
@@ -241,7 +242,7 @@ enum DemucsModelFactory {
 /// Optional GPU-native predict for models that can stay on GPU.
 /// Used by BagOfModels to avoid CPU↔GPU roundtrips between sub-models.
 protocol GPUPredictable {
-    func predictGPU(input: MLXArray) -> MLXArray
+    func predictGPU(input: MLXArray, monitor: SeparationMonitor?) throws -> MLXArray
 }
 
 // MARK: - Lightweight Wrappers
@@ -256,13 +257,13 @@ final class HTDemucsModelWrapper: StemSeparationModel, GPUPredictable {
         self.graph = graph
     }
 
-    func predictGPU(input: MLXArray) -> MLXArray {
-        graph(input)
+    func predictGPU(input: MLXArray, monitor: SeparationMonitor? = nil) throws -> MLXArray {
+        try graph.forward(input, monitor: monitor)
     }
 
-    func predict(batchData: [Float], batchSize: Int, channels: Int, frames: Int) throws -> [Float] {
+    func predict(batchData: [Float], batchSize: Int, channels: Int, frames: Int, monitor: SeparationMonitor? = nil) throws -> [Float] {
         let input = MLXArray(batchData).reshaped([batchSize, channels, frames])
-        let output = predictGPU(input: input)
+        let output = try predictGPU(input: input, monitor: monitor)
         MLX.eval(output)
         return output.asArray(Float.self)
     }
@@ -278,13 +279,13 @@ final class HDemucsModelWrapper: StemSeparationModel, GPUPredictable {
         self.graph = graph
     }
 
-    func predictGPU(input: MLXArray) -> MLXArray {
-        graph(input)
+    func predictGPU(input: MLXArray, monitor: SeparationMonitor? = nil) throws -> MLXArray {
+        try graph.forward(input, monitor: monitor)
     }
 
-    func predict(batchData: [Float], batchSize: Int, channels: Int, frames: Int) throws -> [Float] {
+    func predict(batchData: [Float], batchSize: Int, channels: Int, frames: Int, monitor: SeparationMonitor? = nil) throws -> [Float] {
         let input = MLXArray(batchData).reshaped([batchSize, channels, frames])
-        let output = predictGPU(input: input)
+        let output = try predictGPU(input: input, monitor: monitor)
         MLX.eval(output)
         return output.asArray(Float.self)
     }
@@ -300,13 +301,13 @@ final class DemucsModelWrapper: StemSeparationModel, GPUPredictable {
         self.graph = graph
     }
 
-    func predictGPU(input: MLXArray) -> MLXArray {
-        graph(input)
+    func predictGPU(input: MLXArray, monitor: SeparationMonitor? = nil) throws -> MLXArray {
+        try graph.forward(input, monitor: monitor)
     }
 
-    func predict(batchData: [Float], batchSize: Int, channels: Int, frames: Int) throws -> [Float] {
+    func predict(batchData: [Float], batchSize: Int, channels: Int, frames: Int, monitor: SeparationMonitor? = nil) throws -> [Float] {
         let input = MLXArray(batchData).reshaped([batchSize, channels, frames])
-        let output = predictGPU(input: input)
+        let output = try predictGPU(input: input, monitor: monitor)
         MLX.eval(output)
         return output.asArray(Float.self)
     }

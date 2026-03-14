@@ -3,6 +3,7 @@ import Foundation
 struct SeparationEngine {
     let model: StemSeparationModel
     let parameters: DemucsSeparationParameters
+    let monitor: SeparationMonitor?
 
     private var sourceCount: Int { model.descriptor.sourceNames.count }
 
@@ -12,7 +13,10 @@ struct SeparationEngine {
         frames: Int,
         sampleRate: Int
     ) throws -> [Float] {
+        try self.monitor?.checkCancellation()
+
         if parameters.shifts <= 1 {
+            self.monitor?.reportProgress(0.0, stage: "Separating")
             return try separateNoShift(mix: mix, channels: channels, frames: frames, sampleRate: sampleRate)
         }
 
@@ -20,7 +24,12 @@ struct SeparationEngine {
         var rng = SeededGenerator(seed: UInt64(bitPattern: Int64(parameters.seed ?? Int(Date().timeIntervalSince1970))))
         var accumulator = [Float](repeating: 0, count: sourceCount * channels * frames)
 
-        for _ in 0..<parameters.shifts {
+        for shiftIndex in 0..<parameters.shifts {
+            try self.monitor?.checkCancellation()
+
+            let shiftProgress: Float = Float(shiftIndex) / Float(parameters.shifts)
+            self.monitor?.reportProgress(shiftProgress, stage: "Shift \(shiftIndex + 1)/\(parameters.shifts)")
+
             let shift = rng.nextInt(upperBound: maxShift)
             let rolled = rollChannelMajor(mix, channels: channels, frames: frames, shift: shift)
             let estimate = try separateNoShift(mix: rolled, channels: channels, frames: frames, sampleRate: sampleRate)
@@ -72,15 +81,31 @@ struct SeparationEngine {
         var batchData: [Float] = []
         var batchOffsets: [Int] = []
         var batchLengths: [Int] = []
+        var batchStartChunkIndex = 0
 
         func flushBatch() throws {
             guard !batchOffsets.isEmpty else { return }
             let batchCount = batchOffsets.count
+
+            // Create a scoped monitor so the model reports sub-step progress
+            // mapped to this batch's slice of overall progress
+            let batchMonitor: SeparationMonitor?
+            if let m = self.monitor {
+                let total = Float(offsets.count)
+                batchMonitor = m.scoped(
+                    start: Float(batchStartChunkIndex) / total,
+                    end: Float(batchStartChunkIndex + batchCount) / total
+                )
+            } else {
+                batchMonitor = nil
+            }
+
             let output = try runModelBatch(
                 batchData: batchData,
                 batchCount: batchCount,
                 channels: channels,
-                frames: segmentFrames
+                frames: segmentFrames,
+                monitor: batchMonitor
             )
 
             for b in 0..<batchCount {
@@ -109,7 +134,9 @@ struct SeparationEngine {
             batchLengths.removeAll(keepingCapacity: true)
         }
 
-        for chunkOffset in offsets {
+        for (chunkIndex, chunkOffset) in offsets.enumerated() {
+            try self.monitor?.checkCancellation()
+
             let chunkLength = min(segmentFrames, frames - chunkOffset)
             var chunk = [Float](repeating: 0, count: channels * segmentFrames)
             for c in 0..<channels {
@@ -120,6 +147,9 @@ struct SeparationEngine {
                 }
             }
 
+            if batchOffsets.isEmpty {
+                batchStartChunkIndex = chunkIndex
+            }
             batchData.append(contentsOf: chunk)
             batchOffsets.append(chunkOffset)
             batchLengths.append(chunkLength)
@@ -129,6 +159,7 @@ struct SeparationEngine {
             }
         }
 
+        try self.monitor?.checkCancellation()
         try flushBatch()
 
         for s in 0..<sourceCount {
@@ -149,20 +180,22 @@ struct SeparationEngine {
         channels: Int,
         frames: Int
     ) throws -> [Float] {
-        try runModelBatch(batchData: mix, batchCount: 1, channels: channels, frames: frames)
+        try runModelBatch(batchData: mix, batchCount: 1, channels: channels, frames: frames, monitor: self.monitor)
     }
 
     private func runModelBatch(
         batchData: [Float],
         batchCount: Int,
         channels: Int,
-        frames: Int
+        frames: Int,
+        monitor: SeparationMonitor? = nil
     ) throws -> [Float] {
         try model.predict(
             batchData: batchData,
             batchSize: batchCount,
             channels: channels,
-            frames: frames
+            frames: frames,
+            monitor: monitor
         )
     }
 

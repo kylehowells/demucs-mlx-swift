@@ -520,6 +520,14 @@ final class DemucsGraph: Module {
     // MARK: - Forward Pass
 
     func callAsFunction(_ mix: MLXArray) -> MLXArray {
+        try! forward(mix, monitor: nil)
+    }
+
+    func forward(_ mix: MLXArray, monitor: SeparationMonitor?) throws -> MLXArray {
+        // Sub-step progress: encoder×depth + LSTM + decoder×depth
+        let totalSteps = Float(config.depth + 1 + config.depth)
+        var step: Float = 0
+
         var x = mix
         let length = x.dim(-1)
 
@@ -550,10 +558,16 @@ final class DemucsGraph: Module {
 
         // Encode
         var saved: [MLXArray] = []
-        for enc in encoder {
+        for (idx, enc) in encoder.enumerated() {
+            monitor?.reportProgress(step / totalSteps, stage: "Encoder \(idx + 1)/\(config.depth)")
+            try monitor?.checkCancellation()
             x = enc(x)
             saved.append(x)
+            step += 1
         }
+
+        monitor?.reportProgress(step / totalSteps, stage: "LSTM")
+        try monitor?.checkCancellation()
 
         // Bottleneck LSTM
         if let lstmMod = lstm {
@@ -561,10 +575,14 @@ final class DemucsGraph: Module {
         }
 
         // Decode with skip connections
-        for dec in decoder {
+        step += 1
+        for (idx, dec) in decoder.enumerated() {
+            monitor?.reportProgress(step / totalSteps, stage: "Decoder \(idx + 1)/\(config.depth)")
+            try monitor?.checkCancellation()
             var skip = saved.removeLast()
             skip = demucsCenterTrim(skip, referenceLength: x.dim(-1))
             x = dec(x + skip)
+            step += 1
         }
 
         // Resample 2x down

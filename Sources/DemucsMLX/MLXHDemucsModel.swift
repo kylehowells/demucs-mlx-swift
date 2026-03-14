@@ -467,7 +467,18 @@ final class HDemucsGraph: Module {
     // MARK: - Forward Pass
 
     func callAsFunction(_ mix: MLXArray) -> MLXArray {
+        try! forward(mix, monitor: nil)
+    }
+
+    func forward(_ mix: MLXArray, monitor: SeparationMonitor?) throws -> MLXArray {
+        // Sub-step progress: STFT + encoder×depth + decoder×depth + output
+        let totalSteps = Float(1 + config.depth + config.depth + 1)
+        var step: Float = 0
+
         let originalLength = mix.dim(-1)
+
+        monitor?.reportProgress(0, stage: "STFT")
+        try monitor?.checkCancellation()
 
         // Spectral analysis
         let z = spec(mix)
@@ -499,7 +510,11 @@ final class HDemucsGraph: Module {
         var lengthsT: [Int] = []
 
         // Encoder
+        step = 1
         for idx in 0..<encoder.count {
+            monitor?.reportProgress(step / totalSteps, stage: "Encoder \(idx + 1)/\(config.depth)")
+            try monitor?.checkCancellation()
+
             lengths.append(x.dim(-1))
             let enc = encoder[idx] as! HEncoderLayer
 
@@ -510,7 +525,8 @@ final class HDemucsGraph: Module {
                 xt = tenc(xt, inject: nil)
                 if !tenc.empty {
                     savedT.append(xt)
-                } else {
+                }
+                else {
                     inject = xt
                 }
             }
@@ -526,16 +542,23 @@ final class HDemucsGraph: Module {
             }
 
             saved.append(x)
+            step += 1
         }
+
+        try monitor?.checkCancellation()
 
         // Bottleneck: zero-initialized (key difference from HTDemucs)
         x = MLXArray.zeros(like: x)
         if config.hybrid {
             xt = MLXArray.zeros(like: xt)
         }
+
         // Decoder
         let offset = config.depth - tdecoder.count
         for idx in 0..<decoder.count {
+            monitor?.reportProgress(step / totalSteps, stage: "Decoder \(idx + 1)/\(config.depth)")
+            try monitor?.checkCancellation()
+
             let skip = saved.removeLast()
             let length = lengths.removeLast()
             let dec = decoder[idx] as! HDecoderLayer
@@ -552,13 +575,18 @@ final class HDemucsGraph: Module {
                     let preFlat = pre[0..., 0..., 0, 0...]
                     let tdecoded = tdec(preFlat, skip: MLXArray.zeros([1]), length: lengthT)
                     xt = tdecoded.0
-                } else {
+                }
+                else {
                     let skipT = savedT.removeLast()
                     let tdecoded = tdec(xt, skip: skipT, length: lengthT)
                     xt = tdecoded.0
                 }
             }
+            step += 1
         }
+
+        monitor?.reportProgress(step / totalSteps, stage: "Output")
+        try monitor?.checkCancellation()
 
         // Reshape and denormalize frequency output
         let s = config.sources.count
@@ -579,7 +607,8 @@ final class HDemucsGraph: Module {
             if xWave.dim(-1) != xt.dim(-1) {
                 if xWave.dim(-1) > xt.dim(-1) {
                     xWave = demucsCenterTrim(xWave, referenceLength: xt.dim(-1))
-                } else {
+                }
+                else {
                     xt = demucsCenterTrim(xt, referenceLength: xWave.dim(-1))
                 }
             }
