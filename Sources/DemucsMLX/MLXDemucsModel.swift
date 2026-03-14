@@ -555,7 +555,6 @@ final class DemucsGraph: Module {
         if config.resample {
             x = resample2x(x)
         }
-
         // Encode
         var saved: [MLXArray] = []
         for (idx, enc) in encoder.enumerated() {

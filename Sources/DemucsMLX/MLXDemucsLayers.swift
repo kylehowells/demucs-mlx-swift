@@ -142,8 +142,33 @@ final class ConvTranspose1dNCL: Module, DemucsUnaryLayer {
         super.init()
     }
 
+    /// Metal's max buffer size (36 GB on most Apple Silicon Macs).
+    private static let metalMaxBuffer = 38_654_705_664
+
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let nlc = x.transposed(0, 2, 1)
+
+        // MLX's ConvTranspose1d allocates an im2col workspace of
+        // [B, L_out, C_in * kernel] which can exceed Metal's per-buffer limit
+        // for large temporal dimensions. Process per-sample when needed.
+        let b = x.dim(0)
+        if b > 1 {
+            let t = x.dim(2)
+            let cIn = x.dim(1)
+            let kernel = conv.weight.dim(1)
+            let stride = conv.stride
+            let lOut = (t - 1) * stride + kernel
+            let workspaceBytes = b * lOut * cIn * kernel * 4
+            if workspaceBytes > ConvTranspose1dNCL.metalMaxBuffer {
+                var results: [MLXArray] = []
+                results.reserveCapacity(b)
+                for i in 0..<b {
+                    results.append(conv(nlc[i...i]))
+                }
+                return concatenated(results, axis: 0).transposed(0, 2, 1)
+            }
+        }
+
         let y = conv(nlc)
         return y.transposed(0, 2, 1)
     }
