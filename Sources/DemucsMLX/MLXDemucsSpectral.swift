@@ -1,5 +1,3 @@
-import Accelerate
-import Dispatch
 import Foundation
 import MLX
 
@@ -74,7 +72,7 @@ final class DemucsSpectralPair {
         return DemucsComplexSpectrogram(real: realOut, imag: imagOut)
     }
 
-    // MARK: - iSTFT: GPU irfft + CPU overlap-add
+    // MARK: - iSTFT: GPU irfft + GPU overlap-add (Metal kernel)
 
     func istft(_ z: DemucsComplexSpectrogram, length: Int) -> MLXArray {
         precondition(z.real.shape == z.imag.shape)
@@ -113,78 +111,18 @@ final class DemucsSpectralPair {
         // Apply window on GPU
         let windowed = timeFrames * windowArray  // [outer, frames, nFFT]
 
-        // Evaluate to bring to CPU for overlap-add
-        MLX.eval(windowed)
-
-        // Overlap-add on CPU (parallelized across channels)
-        let windowVals = windowArray.asArray(Float.self)
-        let frameData = windowed.asArray(Float.self)
-
-        let rawLength = nFFT + max(0, frames - 1) * hopLength
-        let eps: Float = 1e-8
-
-        // Precompute window squared denominator (shared across all channels)
-        var windowDenom = [Float](repeating: 0, count: rawLength)
-        windowDenom.withUnsafeMutableBufferPointer { denom in
-            windowSquared.withUnsafeBufferPointer { wsq in
-                for fi in 0..<frames {
-                    let start = fi * hopLength
-                    vDSP_vadd(
-                        denom.baseAddress! + start, 1,
-                        wsq.baseAddress!, 1,
-                        denom.baseAddress! + start, 1,
-                        vDSP_Length(nFFT)
-                    )
-                }
-            }
-        }
-        // Apply epsilon floor and invert for multiplication
-        let invDenom: [Float] = (0..<rawLength).map { 1.0 / max(windowDenom[$0], eps) }
-
-        let centerOffset = center ? (nFFT / 2) : 0
-        let outAll = UnsafeMutableBufferPointer<Float>.allocate(capacity: outer * length)
-        outAll.initialize(repeating: 0)
-        let outPtr = outAll.baseAddress!
-
-        // Parallel overlap-add: each outer channel is independent
-        let capturedNFFT = nFFT
-        let capturedHopLength = hopLength
-        frameData.withUnsafeBufferPointer { frameBuf in
-            invDenom.withUnsafeBufferPointer { invBuf in
-                DispatchQueue.concurrentPerform(iterations: outer) { o in
-                    var signal = [Float](repeating: 0, count: rawLength)
-                    signal.withUnsafeMutableBufferPointer { sig in
-                        for fi in 0..<frames {
-                            let srcBase = (o * frames + fi) * capturedNFFT
-                            let start = fi * capturedHopLength
-                            vDSP_vadd(
-                                sig.baseAddress! + start, 1,
-                                frameBuf.baseAddress! + srcBase, 1,
-                                sig.baseAddress! + start, 1,
-                                vDSP_Length(capturedNFFT)
-                            )
-                        }
-
-                        // Normalize by inverse window squared sum
-                        vDSP_vmul(
-                            sig.baseAddress!, 1,
-                            invBuf.baseAddress!, 1,
-                            sig.baseAddress!, 1,
-                            vDSP_Length(rawLength)
-                        )
-
-                        // Copy trimmed result
-                        let copyLen = min(length, max(0, rawLength - 2 * centerOffset))
-                        let base = o * length
-                        memcpy(outPtr + base, sig.baseAddress! + centerOffset, copyLen * MemoryLayout<Float>.size)
-                    }
-                }
-            }
-        }
-
-        let result = MLXArray(Array(outAll)).reshaped(finalShapePrefix + [length])
-        outAll.deallocate()
-        return result
+        // GPU overlap-add via fused Metal kernel (no CPU roundtrip)
+        let windowSqArray = MLXArray(windowSquared)
+        return metalISTFTOverlapAdd(
+            windowed: windowed,
+            windowSq: windowSqArray,
+            numFrames: frames,
+            nFFT: nFFT,
+            hopLength: hopLength,
+            targetLength: length,
+            center: center,
+            finalShape: finalShapePrefix
+        )
     }
 
     // MARK: - Reflect padding on GPU

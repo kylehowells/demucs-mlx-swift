@@ -651,6 +651,106 @@ nonisolated(unsafe) private let resampleFIRKernel: MLXArray = {
     return MLXArray(h.map { $0 / sum })
 }()
 
+// MARK: - Fused iSTFT Overlap-Add Kernel
+
+/// Metal kernel for iSTFT overlap-add: accumulates windowed frames and normalizes.
+/// Each thread computes one output sample by summing all contributing frames.
+private let istftOverlapAddSource = """
+uint gid = thread_position_in_grid.x;
+uint numFrames = params[0];
+uint nFFT = params[1];
+uint hopLength = params[2];
+uint rawLength = params[3];
+uint targetLength = params[4];
+uint centerOffset = params[5];
+uint outerCount = params[6];
+uint total = outerCount * targetLength;
+
+if (gid >= total) return;
+
+uint o = gid / targetLength;
+uint outIdx = gid % targetLength;
+
+// Map output index to raw signal position (accounting for center padding)
+uint rawPos = outIdx + centerOffset;
+if (rawPos >= rawLength) {
+    out[gid] = (T)0.0f;
+    return;
+}
+
+// Accumulate windowed frame contributions at this position
+float signal = 0.0f;
+float denominator = 0.0f;
+
+// Determine which frames contribute to this position
+uint firstFrame = (rawPos >= nFFT) ? ((rawPos - nFFT + hopLength) / hopLength) : 0;
+uint lastFrame = min(rawPos / hopLength, numFrames - 1);
+
+uint frameBase = o * numFrames * nFFT;
+
+for (uint fi = firstFrame; fi <= lastFrame; fi++) {
+    uint frameStart = fi * hopLength;
+    uint posInFrame = rawPos - frameStart;
+    signal += (float)windowed[frameBase + fi * nFFT + posInFrame];
+    denominator += (float)windowSq[posInFrame];
+}
+
+denominator = max(denominator, 1e-8f);
+out[gid] = (T)(signal / denominator);
+"""
+
+nonisolated(unsafe) private var _istftOverlapAddKernel: MLXFast.MLXFastKernel? = nil
+
+private func getISTFTOverlapAddKernel() -> MLXFast.MLXFastKernel {
+    if let k = _istftOverlapAddKernel { return k }
+    let k = MLXFast.metalKernel(
+        name: "fused_istft_overlap_add",
+        inputNames: ["windowed", "windowSq", "params"],
+        outputNames: ["out"],
+        source: istftOverlapAddSource
+    )
+    _istftOverlapAddKernel = k
+    return k
+}
+
+/// GPU-native iSTFT overlap-add using a fused Metal kernel.
+func metalISTFTOverlapAdd(
+    windowed: MLXArray,
+    windowSq: MLXArray,
+    numFrames: Int,
+    nFFT: Int,
+    hopLength: Int,
+    targetLength: Int,
+    center: Bool,
+    finalShape: [Int]
+) -> MLXArray {
+    let outer = windowed.dim(0)
+    let rawLength = nFFT + max(0, numFrames - 1) * hopLength
+    let centerOffset = center ? (nFFT / 2) : 0
+    let total = outer * targetLength
+
+    let windowedFlat = contiguous(windowed.reshaped([outer, numFrames * nFFT]))
+    let windowSqFlat = contiguous(windowSq)
+
+    let params = MLXArray([
+        Int32(numFrames), Int32(nFFT), Int32(hopLength),
+        Int32(rawLength), Int32(targetLength), Int32(centerOffset), Int32(outer)
+    ])
+
+    let resultFlat = getISTFTOverlapAddKernel()(
+        [windowedFlat, windowSqFlat, params],
+        template: [("T", windowed.dtype)],
+        grid: (total, 1, 1),
+        threadGroup: (min(256, total), 1, 1),
+        outputShapes: [[total]],
+        outputDTypes: [windowed.dtype]
+    )[0]
+
+    return resultFlat.reshaped(finalShape + [targetLength])
+}
+
+// MARK: - Fused Resample Kernels
+
 /// GPU-native upsample by 2 using a fused Metal kernel.
 /// Input shape: [B, C, T] → Output shape: [B, C, 2*T]
 func metalResample2x(_ x: MLXArray) -> MLXArray {
