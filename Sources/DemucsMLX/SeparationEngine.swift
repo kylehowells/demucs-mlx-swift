@@ -1,3 +1,4 @@
+import Accelerate
 import Foundation
 
 struct SeparationEngine {
@@ -112,20 +113,36 @@ struct SeparationEngine {
                 let chunkOffset = batchOffsets[b]
                 let chunkLength = batchLengths[b]
 
-                for s in 0..<sourceCount {
-                    for c in 0..<channels {
-                        for t in 0..<chunkLength {
-                            let globalTime = chunkOffset + t
-                            let weight = weights[t]
-                            let srcIndex = ((((b * sourceCount + s) * channels + c) * segmentFrames) + t)
-                            let dstIndex = (((s * channels + c) * frames) + globalTime)
-                            out[dstIndex] += output[srcIndex] * weight
+                output.withUnsafeBufferPointer { outputBuf in
+                    weights.withUnsafeBufferPointer { weightBuf in
+                        out.withUnsafeMutableBufferPointer { outBuf in
+                            for s in 0..<sourceCount {
+                                for c in 0..<channels {
+                                    let srcBase = (((b * sourceCount + s) * channels + c) * segmentFrames)
+                                    let dstBase = ((s * channels + c) * frames) + chunkOffset
+                                    // out[dst+t] = output[src+t] * weight[t] + out[dst+t]
+                                    vDSP_vma(
+                                        outputBuf.baseAddress! + srcBase, 1,
+                                        weightBuf.baseAddress!, 1,
+                                        outBuf.baseAddress! + dstBase, 1,
+                                        outBuf.baseAddress! + dstBase, 1,
+                                        vDSP_Length(chunkLength)
+                                    )
+                                }
+                            }
                         }
                     }
                 }
 
-                for t in 0..<chunkLength {
-                    sumWeight[chunkOffset + t] += weights[t]
+                sumWeight.withUnsafeMutableBufferPointer { swBuf in
+                    weights.withUnsafeBufferPointer { wBuf in
+                        vDSP_vadd(
+                            swBuf.baseAddress! + chunkOffset, 1,
+                            wBuf.baseAddress!, 1,
+                            swBuf.baseAddress! + chunkOffset, 1,
+                            vDSP_Length(chunkLength)
+                        )
+                    }
                 }
             }
 
@@ -162,12 +179,29 @@ struct SeparationEngine {
         try self.monitor?.checkCancellation()
         try flushBatch()
 
-        for s in 0..<sourceCount {
-            for c in 0..<channels {
+        // Invert sumWeight for multiplication (faster than per-element division)
+        var invWeight = [Float](repeating: 0, count: frames)
+        invWeight.withUnsafeMutableBufferPointer { inv in
+            sumWeight.withUnsafeBufferPointer { sw in
+                // Floor at 1e-6 then invert
                 for t in 0..<frames {
-                    let denom = max(sumWeight[t], 1e-6)
-                    let idx = ((s * channels + c) * frames + t)
-                    out[idx] /= denom
+                    inv[t] = 1.0 / max(sw[t], 1e-6)
+                }
+            }
+        }
+
+        out.withUnsafeMutableBufferPointer { outBuf in
+            invWeight.withUnsafeBufferPointer { invBuf in
+                for s in 0..<sourceCount {
+                    for c in 0..<channels {
+                        let base = (s * channels + c) * frames
+                        vDSP_vmul(
+                            outBuf.baseAddress! + base, 1,
+                            invBuf.baseAddress!, 1,
+                            outBuf.baseAddress! + base, 1,
+                            vDSP_Length(frames)
+                        )
+                    }
                 }
             }
         }

@@ -353,41 +353,21 @@ final class HTDemucsGraph: Module {
         super.init()
     }
 
+    /// GPU-native reflect padding along the temporal (last) axis of a [B, C, T] tensor.
     private func reflectPad1D3D(_ x: MLXArray, left: Int, right: Int) -> MLXArray {
-        let b = x.dim(0)
-        let c = x.dim(1)
         let t = x.dim(2)
-        let src = x.asArray(Float.self)
-
-        let outT = t + left + right
-        var out = [Float](repeating: 0, count: b * c * outT)
-
-        for bc in 0..<(b * c) {
-            let inBase = bc * t
-            let outBase = bc * outT
-
-            let signal = Array(src[inBase..<(inBase + t)])
-            var padded = [Float]()
-            padded.reserveCapacity(outT)
-
-            if left > 0 {
-                for i in 0..<left {
-                    let idx = max(0, min(signal.count - 1, left - i))
-                    padded.append(signal[idx])
-                }
-            }
-            padded.append(contentsOf: signal)
-            if right > 0 {
-                for i in 0..<right {
-                    let idx = max(0, min(signal.count - 1, signal.count - 2 - i))
-                    padded.append(signal[idx])
-                }
-            }
-
-            out.replaceSubrange(outBase..<(outBase + outT), with: padded)
+        var indices = [Int32]()
+        indices.reserveCapacity(t + left + right)
+        for i in stride(from: left, through: 1, by: -1) {
+            indices.append(Int32(min(i, t - 1)))
         }
-
-        return MLXArray(out).reshaped([b, c, outT])
+        for i in 0..<t {
+            indices.append(Int32(i))
+        }
+        for i in 0..<right {
+            indices.append(Int32(max(0, t - 2 - i)))
+        }
+        return x.take(MLXArray(indices), axis: 2)
     }
 
     private func spec(_ x: MLXArray) -> DemucsComplexSpectrogram {
