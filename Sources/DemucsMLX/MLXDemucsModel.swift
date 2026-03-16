@@ -1,3 +1,4 @@
+import Accelerate
 import Foundation
 import MLX
 import MLXNN
@@ -395,16 +396,10 @@ final class DemucsGraph: Module {
         return l
     }
 
-    // MARK: - Resampling
+    // MARK: - Resampling (Accelerate/vDSP)
 
-    /// Upsample by 2 using zero-insertion + lowpass FIR
-    private func resample2x(_ x: MLXArray) -> MLXArray {
-        let b = x.dim(0)
-        let c = x.dim(1)
-        let t = x.dim(2)
-        let samples = x.asArray(Float.self)
-
-        // Design a simple Hann-windowed sinc lowpass filter
+    /// Precomputed 63-tap Hann-windowed sinc lowpass FIR kernel (cutoff=0.25).
+    private static let firKernel: [Float] = {
         let numtaps = 63
         let cutoff: Float = 0.25
         let half = (numtaps - 1) / 2
@@ -416,16 +411,27 @@ final class DemucsGraph: Module {
             h[n] = 2.0 * cutoff * sinc * window
         }
         let sum = h.reduce(0, +)
-        h = h.map { $0 / sum }
+        return h.map { $0 / sum }
+    }()
 
+    /// Upsample by 2 using zero-insertion + lowpass FIR (Accelerate-optimized).
+    private func resample2x(_ x: MLXArray) -> MLXArray {
+        let b = x.dim(0)
+        let c = x.dim(1)
+        let t = x.dim(2)
+        let samples = x.asArray(Float.self)
+
+        let h = DemucsGraph.firKernel
+        let numtaps = h.count
         let upT = 2 * t
-        let outT = upT
         let pad = numtaps / 2
+        let paddedLen = upT + 2 * pad
 
-        var out = [Float](repeating: 0, count: b * c * outT)
+        var out = [Float](repeating: 0, count: b * c * upT)
 
         for bc in 0..<(b * c) {
             let inBase = bc * t
+
             // Zero-insertion upsample
             var up = [Float](repeating: 0, count: upT)
             for i in 0..<t {
@@ -433,55 +439,54 @@ final class DemucsGraph: Module {
             }
 
             // Reflect-pad
-            var padded = [Float](repeating: 0, count: upT + 2 * pad)
+            var padded = [Float](repeating: 0, count: paddedLen)
             for i in 0..<pad {
-                let idx = min(upT - 1, max(0, pad - i))
-                padded[i] = up[idx]
+                padded[i] = up[min(upT - 1, max(0, pad - i))]
             }
-            for i in 0..<upT {
-                padded[pad + i] = up[i]
+            padded.withUnsafeMutableBufferPointer { dst in
+                up.withUnsafeBufferPointer { src in
+                    dst.baseAddress!.advanced(by: pad).update(from: src.baseAddress!, count: upT)
+                }
             }
             for i in 0..<pad {
-                let idx = min(upT - 1, max(0, upT - 2 - i))
-                padded[pad + upT + i] = up[idx]
+                padded[pad + upT + i] = up[min(upT - 1, max(0, upT - 2 - i))]
             }
 
-            // Convolve (same)
-            let outBase = bc * outT
-            for i in 0..<outT {
-                var acc: Float = 0
-                for k in 0..<numtaps {
-                    acc += padded[i + k] * h[k]
+            // FIR convolution via vDSP, then scale by 2.0
+            let outBase = bc * upT
+            padded.withUnsafeBufferPointer { pBuf in
+                h.withUnsafeBufferPointer { hBuf in
+                    out.withUnsafeMutableBufferPointer { oBuf in
+                        vDSP_conv(pBuf.baseAddress!, 1,
+                                  hBuf.baseAddress! + numtaps - 1, -1,
+                                  oBuf.baseAddress! + outBase, 1,
+                                  vDSP_Length(upT), vDSP_Length(numtaps))
+                    }
                 }
-                out[outBase + i] = acc * 2.0 // Scale by upsample factor
+            }
+            // Scale by upsample factor
+            var scale: Float = 2.0
+            out.withUnsafeMutableBufferPointer { oBuf in
+                vDSP_vsmul(oBuf.baseAddress! + outBase, 1, &scale,
+                           oBuf.baseAddress! + outBase, 1, vDSP_Length(upT))
             }
         }
 
-        return MLXArray(out).reshaped([b, c, outT])
+        return MLXArray(out).reshaped([b, c, upT])
     }
 
-    /// Downsample by 2 using lowpass FIR + decimation
+    /// Downsample by 2 using lowpass FIR + decimation (Accelerate-optimized).
     private func resampleHalf(_ x: MLXArray) -> MLXArray {
         let b = x.dim(0)
         let c = x.dim(1)
         let t = x.dim(2)
         let samples = x.asArray(Float.self)
 
-        let numtaps = 63
-        let cutoff: Float = 0.25
-        let half = (numtaps - 1) / 2
-        var h = [Float](repeating: 0, count: numtaps)
-        for n in 0..<numtaps {
-            let tn = Float(n - half)
-            let sinc: Float = tn == 0 ? 1.0 : sin(Float.pi * 2.0 * cutoff * tn) / (Float.pi * 2.0 * cutoff * tn)
-            let window: Float = 0.5 - 0.5 * cos(2.0 * Float.pi * Float(n) / Float(numtaps - 1))
-            h[n] = 2.0 * cutoff * sinc * window
-        }
-        let sum = h.reduce(0, +)
-        h = h.map { $0 / sum }
-
+        let h = DemucsGraph.firKernel
+        let numtaps = h.count
         let pad = numtaps / 2
         let outT = (t + 1) / 2
+        let paddedLen = t + 2 * pad
 
         var out = [Float](repeating: 0, count: b * c * outT)
 
@@ -489,28 +494,30 @@ final class DemucsGraph: Module {
             let inBase = bc * t
 
             // Reflect-pad
-            var padded = [Float](repeating: 0, count: t + 2 * pad)
+            var padded = [Float](repeating: 0, count: paddedLen)
             for i in 0..<pad {
-                let idx = min(t - 1, max(0, pad - i))
-                padded[i] = samples[inBase + idx]
+                padded[i] = samples[inBase + min(t - 1, max(0, pad - i))]
             }
-            for i in 0..<t {
-                padded[pad + i] = samples[inBase + i]
+            padded.withUnsafeMutableBufferPointer { dst in
+                samples.withUnsafeBufferPointer { src in
+                    dst.baseAddress!.advanced(by: pad).update(from: src.baseAddress! + inBase, count: t)
+                }
             }
             for i in 0..<pad {
-                let idx = min(t - 1, max(0, t - 2 - i))
-                padded[pad + t + i] = samples[inBase + idx]
+                padded[pad + t + i] = samples[inBase + min(t - 1, max(0, t - 2 - i))]
             }
 
-            // Convolve + decimate
+            // FIR convolution + decimation via vDSP_desamp
             let outBase = bc * outT
-            for i in 0..<outT {
-                let srcIdx = 2 * i
-                var acc: Float = 0
-                for k in 0..<numtaps {
-                    acc += padded[srcIdx + k] * h[k]
+            padded.withUnsafeBufferPointer { pBuf in
+                h.withUnsafeBufferPointer { hBuf in
+                    out.withUnsafeMutableBufferPointer { oBuf in
+                        vDSP_desamp(pBuf.baseAddress!, 2,
+                                    hBuf.baseAddress!,
+                                    oBuf.baseAddress! + outBase,
+                                    vDSP_Length(outT), vDSP_Length(numtaps))
+                    }
                 }
-                out[outBase + i] = acc
             }
         }
 
