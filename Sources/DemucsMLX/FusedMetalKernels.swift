@@ -12,7 +12,31 @@ private func _hasMetal() -> Bool {
     return device.deviceType == .gpu
 }
 
+/// Xcode's Metal debug/capture wrappers can abort while MLX custom kernels are
+/// releasing pipeline state objects. When these wrappers are active, prefer
+/// the pure-MLX/CPU fallback paths for stability.
+private func _metalDebugToolsActive() -> Bool {
+    let env = ProcessInfo.processInfo.environment
+    let keys = [
+        "MTL_DEBUG_LAYER",
+        "METAL_LOAD_INTERPOSER",
+        "GPUTOOLS_LOAD_GTMTLCAPTURE",
+        "MTLCAPTURE_DESTINATION_DEVELOPER_TOOLS_ENABLE",
+    ]
+    return keys.contains { env[$0] == "1" }
+}
+
+private func _customMetalKernelsEnabled() -> Bool {
+    let env = ProcessInfo.processInfo.environment
+    if let override = env["DEMUCS_MLX_ENABLE_CUSTOM_METAL_KERNELS"]?.lowercased() {
+        return ["1", "true", "yes"].contains(override)
+    }
+    return hasMetal && !metalDebugToolsActive
+}
+
 let hasMetal: Bool = _hasMetal()
+let metalDebugToolsActive: Bool = _metalDebugToolsActive()
+let customMetalKernelsEnabled: Bool = _customMetalKernelsEnabled()
 
 /// Threshold: when elements per group exceeds this, use pure MLX ops
 /// instead of the single-threadgroup Metal kernel (which underutilizes the GPU).
@@ -64,7 +88,7 @@ private func getGLUKernel() -> MLXFast.MLXFastKernel {
 ///     let parts = split(x, parts: 2, axis: axis)
 ///     return parts[0] * sigmoid(parts[1])
 func fusedGLU(_ x: MLXArray, axis: Int = 1) -> MLXArray {
-    if !hasMetal {
+    if !customMetalKernelsEnabled {
         let parts = split(x, parts: 2, axis: axis)
         return parts[0] * sigmoid(parts[1])
     }
@@ -271,7 +295,7 @@ func fusedGroupNormGELU(
     numGroups: Int,
     eps: Float = 1e-5
 ) -> MLXArray {
-    if !hasMetal {
+    if !customMetalKernelsEnabled {
         return groupNormGELUFallback(x, weight: weight, bias: bias, numGroups: numGroups, eps: eps)
     }
 
@@ -496,7 +520,7 @@ func fusedGroupNormGLU(
     // - No Metal available
     // - Large groups (few threadgroups -> GPU underutilization)
     // - numGroups > 1 (GLU split crosses group boundaries)
-    if !hasMetal || numGroups > 1 || elemsPerGroup > hybridThreshold {
+    if !customMetalKernelsEnabled || numGroups > 1 || elemsPerGroup > hybridThreshold {
         return groupNormGLUFallback(x, weight: weight, bias: bias, numGroups: numGroups, eps: eps)
     }
 
@@ -638,7 +662,7 @@ private func getResampleHalfKernel() -> MLXFast.MLXFastKernel {
 }
 
 /// Precomputed 63-tap Hann-windowed sinc lowpass FIR kernel (cutoff=0.25).
-nonisolated(unsafe) private let resampleFIRKernel: MLXArray = {
+private let resampleFIRCoefficients: [Float] = {
     let numtaps = 63
     let cutoff: Float = 0.25
     let half = (numtaps - 1) / 2
@@ -650,8 +674,10 @@ nonisolated(unsafe) private let resampleFIRKernel: MLXArray = {
         h[n] = 2.0 * cutoff * sinc * window
     }
     let sum = h.reduce(0, +)
-    return MLXArray(h.map { $0 / sum })
+    return h.map { $0 / sum }
 }()
+
+nonisolated(unsafe) private let resampleFIRKernel: MLXArray = MLXArray(resampleFIRCoefficients)
 
 // MARK: - Fused iSTFT Overlap-Add Kernel
 
@@ -726,6 +752,19 @@ func metalISTFTOverlapAdd(
     center: Bool,
     finalShape: [Int]
 ) -> MLXArray {
+    if !customMetalKernelsEnabled {
+        return cpuISTFTOverlapAdd(
+            windowed: windowed,
+            windowSq: windowSq,
+            numFrames: numFrames,
+            nFFT: nFFT,
+            hopLength: hopLength,
+            targetLength: targetLength,
+            center: center,
+            finalShape: finalShape
+        )
+    }
+
     let outer = windowed.dim(0)
     let rawLength = nFFT + max(0, numFrames - 1) * hopLength
     let centerOffset = center ? (nFFT / 2) : 0
@@ -751,11 +790,64 @@ func metalISTFTOverlapAdd(
     return resultFlat.reshaped(finalShape + [targetLength])
 }
 
+private func cpuISTFTOverlapAdd(
+    windowed: MLXArray,
+    windowSq: MLXArray,
+    numFrames: Int,
+    nFFT: Int,
+    hopLength: Int,
+    targetLength: Int,
+    center: Bool,
+    finalShape: [Int]
+) -> MLXArray {
+    let outer = windowed.dim(0)
+    let rawLength = nFFT + max(0, numFrames - 1) * hopLength
+    let centerOffset = center ? (nFFT / 2) : 0
+
+    let windowedFlat = windowed.asArray(Float.self)
+    let windowSqFlat = windowSq.asArray(Float.self)
+    var output = [Float](repeating: 0, count: outer * targetLength)
+
+    for outerIndex in 0..<outer {
+        var signal = [Float](repeating: 0, count: rawLength)
+        var denom = [Float](repeating: 0, count: rawLength)
+        let outerBase = outerIndex * numFrames * nFFT
+
+        for frameIndex in 0..<numFrames {
+            let frameStart = frameIndex * hopLength
+            let frameBase = outerBase + frameIndex * nFFT
+            for sampleIndex in 0..<nFFT {
+                let rawIndex = frameStart + sampleIndex
+                guard rawIndex < rawLength else {
+                    continue
+                }
+                signal[rawIndex] += windowedFlat[frameBase + sampleIndex]
+                denom[rawIndex] += windowSqFlat[sampleIndex]
+            }
+        }
+
+        let outputBase = outerIndex * targetLength
+        for outputIndex in 0..<targetLength {
+            let rawIndex = outputIndex + centerOffset
+            guard rawIndex < rawLength else {
+                continue
+            }
+            output[outputBase + outputIndex] = signal[rawIndex] / max(denom[rawIndex], 1e-8)
+        }
+    }
+
+    return MLXArray(output).reshaped(finalShape + [targetLength]).asType(windowed.dtype)
+}
+
 // MARK: - Fused Resample Kernels
 
 /// GPU-native upsample by 2 using a fused Metal kernel.
 /// Input shape: [B, C, T] → Output shape: [B, C, 2*T]
 func metalResample2x(_ x: MLXArray) -> MLXArray {
+    if !customMetalKernelsEnabled {
+        return cpuResample2x(x)
+    }
+
     let b = x.dim(0)
     let c = x.dim(1)
     let t = x.dim(2)
@@ -780,6 +872,10 @@ func metalResample2x(_ x: MLXArray) -> MLXArray {
 /// GPU-native downsample by 2 using a fused Metal kernel.
 /// Input shape: [B, C, T] → Output shape: [B, C, (T+1)/2]
 func metalResampleHalf(_ x: MLXArray) -> MLXArray {
+    if !customMetalKernelsEnabled {
+        return cpuResampleHalf(x)
+    }
+
     let b = x.dim(0)
     let c = x.dim(1)
     let t = x.dim(2)
@@ -799,4 +895,64 @@ func metalResampleHalf(_ x: MLXArray) -> MLXArray {
     )[0]
 
     return resultFlat.reshaped([b, c, outT])
+}
+
+private func cpuResample2x(_ x: MLXArray) -> MLXArray {
+    let b = x.dim(0)
+    let c = x.dim(1)
+    let t = x.dim(2)
+    let upT = t * 2
+    let coeffs = resampleFIRCoefficients
+    let pad = coeffs.count / 2
+    let input = x.asArray(Float.self)
+    var output = [Float](repeating: 0, count: b * c * upT)
+
+    for bc in 0..<(b * c) {
+        let inputBase = bc * t
+        let outputBase = bc * upT
+        for outIndex in 0..<upT {
+            var acc: Float = 0
+            for (k, coeff) in coeffs.enumerated() {
+                var ziPos = outIndex + k - pad
+                if ziPos < 0 { ziPos = -ziPos }
+                if ziPos >= upT { ziPos = 2 * upT - 2 - ziPos }
+                ziPos = min(max(ziPos, 0), upT - 1)
+                if ziPos.isMultiple(of: 2) {
+                    acc += input[inputBase + ziPos / 2] * coeff
+                }
+            }
+            output[outputBase + outIndex] = acc * 2
+        }
+    }
+
+    return MLXArray(output).reshaped([b, c, upT]).asType(x.dtype)
+}
+
+private func cpuResampleHalf(_ x: MLXArray) -> MLXArray {
+    let b = x.dim(0)
+    let c = x.dim(1)
+    let t = x.dim(2)
+    let outT = (t + 1) / 2
+    let coeffs = resampleFIRCoefficients
+    let pad = coeffs.count / 2
+    let input = x.asArray(Float.self)
+    var output = [Float](repeating: 0, count: b * c * outT)
+
+    for bc in 0..<(b * c) {
+        let inputBase = bc * t
+        let outputBase = bc * outT
+        for outIndex in 0..<outT {
+            var acc: Float = 0
+            for (k, coeff) in coeffs.enumerated() {
+                var srcPos = 2 * outIndex + k - pad
+                if srcPos < 0 { srcPos = -srcPos }
+                if srcPos >= t { srcPos = 2 * t - 2 - srcPos }
+                srcPos = min(max(srcPos, 0), t - 1)
+                acc += input[inputBase + srcPos] * coeff
+            }
+            output[outputBase + outIndex] = acc
+        }
+    }
+
+    return MLXArray(output).reshaped([b, c, outT]).asType(x.dtype)
 }
