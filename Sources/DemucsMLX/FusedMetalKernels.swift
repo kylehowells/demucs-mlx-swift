@@ -527,7 +527,7 @@ func fusedGroupNormGLU(
 // MARK: - Fused Resample Kernels
 
 /// Metal kernel for upsample 2x: zero-insertion + reflect-pad + FIR filter.
-/// Input: [B*C, T], kernel: [numtaps], params: [T, numtaps]
+/// Input: [B*C, T], filterCoeffs: [numtaps], params: [T, numtaps]
 /// Output: [B*C, 2*T]
 /// Each thread computes one output sample.
 private let resample2xSource = """
@@ -567,7 +567,7 @@ for (uint k = 0; k < numtaps; k++) {
     if (zi_pos % 2 == 0) {
         sample = (float)x[base + zi_pos / 2];
     }
-    acc += sample * kernel[k];
+    acc += sample * filterCoeffs[k];
 }
 
 out[gid] = (T)(acc * 2.0f);  // Scale by upsample factor
@@ -577,9 +577,10 @@ nonisolated(unsafe) private var _resample2xKernel: MLXFast.MLXFastKernel? = nil
 
 private func getResample2xKernel() -> MLXFast.MLXFastKernel {
     if let k = _resample2xKernel { return k }
+    // `kernel` is a reserved Metal keyword, so the generated parameter name must avoid it.
     let k = MLXFast.metalKernel(
         name: "fused_resample2x",
-        inputNames: ["x", "kernel", "params"],
+        inputNames: ["x", "filterCoeffs", "params"],
         outputNames: ["out"],
         source: resample2xSource
     )
@@ -615,7 +616,7 @@ for (uint k = 0; k < numtaps; k++) {
     if (src_pos >= (int)T_in) src_pos = 2 * (int)T_in - 2 - src_pos;
     src_pos = max(0, min(src_pos, (int)T_in - 1));
 
-    acc += (float)x[base + src_pos] * kernel[k];
+    acc += (float)x[base + src_pos] * filterCoeffs[k];
 }
 
 out[gid] = (T)acc;
@@ -625,9 +626,10 @@ nonisolated(unsafe) private var _resampleHalfKernel: MLXFast.MLXFastKernel? = ni
 
 private func getResampleHalfKernel() -> MLXFast.MLXFastKernel {
     if let k = _resampleHalfKernel { return k }
+    // Keep the generated buffer parameter name aligned with the upsample kernel workaround above.
     let k = MLXFast.metalKernel(
         name: "fused_resample_half",
-        inputNames: ["x", "kernel", "params"],
+        inputNames: ["x", "filterCoeffs", "params"],
         outputNames: ["out"],
         source: resampleHalfSource
     )
