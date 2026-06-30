@@ -182,6 +182,7 @@ if (wid == 0) {
 }
 threadgroup_barrier(mem_flags::mem_threadgroup);
 float mean = shared_sums[0] / (float)elems_per_group;
+threadgroup_barrier(mem_flags::mem_threadgroup);
 
 // Pass 2: Compute variance
 float local_var = 0.0f;
@@ -360,6 +361,7 @@ if (wid == 0) {
 }
 threadgroup_barrier(mem_flags::mem_threadgroup);
 float mean = shared_sums[0] / (float)elems_per_group;
+threadgroup_barrier(mem_flags::mem_threadgroup);
 
 // Pass 2: Compute variance
 float local_var = 0.0f;
