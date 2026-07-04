@@ -38,6 +38,7 @@ Model files are downloaded automatically from [Hugging Face](https://huggingface
 - macOS 14+ or iOS 17+
 - Xcode 15+
 - Apple Silicon
+- MLX Metal runtime with `mlx.metallib` available next to the executable
 
 ## Installation (SPM)
 
@@ -125,7 +126,7 @@ let separator = try DemucsSeparator(
 Build:
 
 ```bash
-swift build -c release
+make build
 ```
 
 Run:
@@ -212,15 +213,17 @@ Environment overrides:
 
 ## Metal Shader Library (Required for MLX Inference)
 
-MLX inference requires `mlx.metallib`.
+DemucsMLX treats MLX/Metal as a required runtime, matching the Swift MLX example projects. The library uses MLX GPU operations and repo-owned MLXFast custom kernels as part of the normal inference path; it does not silently fall back to CPU execution for missing or debugged Metal.
 
-After `swift build`, generate it with:
+Build with `make build` or `make debug` so SwiftPM and the MLX Metal shader library are produced together. If you run `swift build` manually, generate the shader library afterward:
 
 ```bash
 ./scripts/build_mlx_metallib.sh release
 ```
 
-If you run an `xcodebuild`/DerivedData binary, place `mlx.metallib` next to that executable.
+If `mlx.metallib` is missing at runtime, MLX inference will fail with an error such as `Failed to load the default metallib`. If you run an `xcodebuild`/DerivedData binary, place `mlx.metallib` next to that executable.
+
+For Metal capture/debugging, use the MLX debugging setup (`MLX_METAL_DEBUG` build plus `MTL_CAPTURE_ENABLED=1`). Custom Demucs kernels are expected to run under Metal tooling; issues there should be debugged as kernel or MLX integration issues rather than bypassed automatically.
 
 If you see `missing Metal Toolchain`, run:
 
