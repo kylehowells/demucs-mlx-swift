@@ -191,9 +191,8 @@ For memory-constrained environments (iOS apps), also consider limiting MLX's mem
 import MLX
 
 // Reduce MLX cache to prevent holding onto large GPU allocations after use.
-// Default is unlimited; 2 MB keeps peak RSS under ~1.3 GB with no speed penalty
-// for single-model inference. Larger caches (unlimited) can give ~25% speedup
-// on some workloads at the cost of ~5x memory retention.
+// Default is unlimited. A 2 MB limit substantially reduces retained GPU memory,
+// but can make inference roughly 25-40% slower depending on the model and device.
 Memory.cacheLimit = 2 * 1024 * 1024
 ```
 

@@ -90,7 +90,7 @@ public struct DemucsCLI: ParsableCommand {
         // e.g. DEMUCS_MLX_CACHE_LIMIT=2097152 for 2 MB
         if let cacheLimitStr = ProcessInfo.processInfo.environment["DEMUCS_MLX_CACHE_LIMIT"],
            let cacheLimitBytes = Int(cacheLimitStr) {
-            MLX.GPU.set(cacheLimit: cacheLimitBytes)
+            Memory.cacheLimit = cacheLimitBytes
         }
 
         let params = DemucsSeparationParameters(
