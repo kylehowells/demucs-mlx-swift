@@ -99,7 +99,9 @@ final class BagOfModels: StemSeparationModel {
         let totalArray = MLXArray(totals).reshaped([1, sourceCount, 1, 1])
         let normalized = result / MLX.maximum(totalArray, MLXArray(Float(1e-8)))
 
-        MLX.eval(normalized)
+        // Same guard as in ModelProtocol: an eval-time MLX error must become a
+        // Swift throw before asArray touches the unevaluated buffer.
+        try MLX.withError { MLX.eval(normalized) }
         return normalized.asArray(Float.self)
     }
 }
