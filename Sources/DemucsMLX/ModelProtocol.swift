@@ -278,7 +278,11 @@ final class HTDemucsModelWrapper: StemSeparationModel, GPUPredictable {
     func predict(batchData: [Float], batchSize: Int, channels: Int, frames: Int, monitor: SeparationMonitor? = nil) throws -> [Float] {
         let input = MLXArray(batchData).reshaped([batchSize, channels, frames])
         let output = try predictGPU(input: input, monitor: monitor)
-        MLX.eval(output)
+        // An MLX error raised while EVALUATING (Metal memory, kernel failure)
+        // leaves `output` unevaluated; reading it with asArray then dereferences
+        // a null buffer in C++ and kills the process. withError turns the MLX
+        // error into a Swift throw before that read.
+        try MLX.withError { MLX.eval(output) }
         return output.asArray(Float.self)
     }
 }
@@ -300,7 +304,11 @@ final class HDemucsModelWrapper: StemSeparationModel, GPUPredictable {
     func predict(batchData: [Float], batchSize: Int, channels: Int, frames: Int, monitor: SeparationMonitor? = nil) throws -> [Float] {
         let input = MLXArray(batchData).reshaped([batchSize, channels, frames])
         let output = try predictGPU(input: input, monitor: monitor)
-        MLX.eval(output)
+        // An MLX error raised while EVALUATING (Metal memory, kernel failure)
+        // leaves `output` unevaluated; reading it with asArray then dereferences
+        // a null buffer in C++ and kills the process. withError turns the MLX
+        // error into a Swift throw before that read.
+        try MLX.withError { MLX.eval(output) }
         return output.asArray(Float.self)
     }
 }
@@ -322,7 +330,11 @@ final class DemucsModelWrapper: StemSeparationModel, GPUPredictable {
     func predict(batchData: [Float], batchSize: Int, channels: Int, frames: Int, monitor: SeparationMonitor? = nil) throws -> [Float] {
         let input = MLXArray(batchData).reshaped([batchSize, channels, frames])
         let output = try predictGPU(input: input, monitor: monitor)
-        MLX.eval(output)
+        // An MLX error raised while EVALUATING (Metal memory, kernel failure)
+        // leaves `output` unevaluated; reading it with asArray then dereferences
+        // a null buffer in C++ and kills the process. withError turns the MLX
+        // error into a Swift throw before that read.
+        try MLX.withError { MLX.eval(output) }
         return output.asArray(Float.self)
     }
 }
